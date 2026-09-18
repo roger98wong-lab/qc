@@ -1,0 +1,39 @@
+.qc-conversation-list { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 14px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 12px; background: #f8fafc; }
+.qc-conversation-row { position: relative; display: flex; align-items: flex-end; gap: 6px; width: fit-content; max-width: min(88%, 680px); min-width: 0; }
+.qc-conversation-row.qc-role-ai, .qc-conversation-row.qc-role-human-agent, .qc-conversation-row.qc-role-system { align-self: flex-end; flex-direction: row-reverse; }
+.qc-conversation-row.qc-role-player, .qc-conversation-row.qc-role-unknown { align-self: flex-start; }
+.qc-conversation-bubble { min-width: 0; max-width: 100%; padding: 11px 13px; overflow-wrap: anywhere; word-break: break-word; border: 1px solid #dbe4f0; border-radius: 12px; background: #fff; color: #172033; box-shadow: 0 2px 8px rgba(15,23,42,.04); }
+.qc-role-ai .qc-conversation-bubble { border-color: #bfdbfe; background: #eff6ff; }
+.qc-role-human-agent .qc-conversation-bubble { border-color: #bbf7d0; background: #f0fdf4; }
+.qc-role-system .qc-conversation-bubble { border-color: #ddd6fe; background: #f5f3ff; }
+.qc-role-unknown .qc-conversation-bubble { border-color: #e2e8f0; background: #f8fafc; }
+.qc-conversation-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; min-width: 0; margin-bottom: 6px; font-size: 11px; }
+.qc-conversation-meta .ant-typography { font-size: 11px; }
+.qc-conversation-identity { display: inline-flex; align-items: center; min-width: 0; gap: 5px; }
+.qc-human-agent-name { color: #166534; font-weight: 600; }
+.qc-role-tag { margin: 0; font-weight: 600; }
+.qc-event-tag { margin: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-color: #fde68a; background: #fffbeb; color: #92400e; }
+.qc-form-fields { display: grid; gap: 6px; min-width: 0; margin: 0; }
+.qc-form-field { display: grid; grid-template-columns: minmax(72px, 28%) minmax(0, 1fr); gap: 8px; min-width: 0; }
+.qc-form-field dt { color: #64748b; font-weight: 600; overflow-wrap: anywhere; word-break: break-word; }
+.qc-form-field dd { min-width: 0; margin: 0; overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
+.qc-message-raw { max-width: 100%; max-height: 240px; margin: 8px 0 0; padding: 8px 10px; overflow: auto; overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; border: 1px dashed #cbd5e1; border-radius: 8px; background: #f8fafc; color: #334155; font-size: 12px; line-height: 1.5; }
+.qc-message-reference-tags { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: auto; }
+.qc-message-ref { margin: 0; border-color: #cbd5e1; background: rgba(255,255,255,.7); color: #475569; font-size: 10px; line-height: 17px; }
+.qc-message-original, .qc-message-translation { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.65; }
+.qc-message-translation { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #cbd5e1; color: #475569; }
+.qc-message-translation span { font-weight: 600; }
+.qc-translation-note, .qc-translation-failed { display: inline-block; margin-top: 8px; color: #b45309; font-size: 12px; }
+.qc-conversation-bubble > .ant-btn-link { display: block; height: auto; margin-top: 4px; padding: 2px 0; font-size: 12px; }
+.qc-conversation-row.is-highlighted .qc-conversation-bubble { outline: 3px solid rgba(245,158,11,.28); border-color: #f59e0b; }
+.qc-conversation-reference-missing { align-self: center; padding: 6px 12px; border: 1px solid #fde68a; border-radius: 999px; background: #fffbeb; color: #92400e; font-size: 12px; }
+.qc-conversation-state { padding: 28px 12px; text-align: center; color: #64748b; }
+.qc-conversation-error { color: #b91c1c; }
+@media (max-width: 768px) {
+  .qc-conversation-list { padding: 10px; }
+  .qc-conversation-row { max-width: calc(100% - 8px); }
+  .qc-conversation-bubble { padding: 10px 11px; }
+  .qc-conversation-meta { align-items: flex-start; }
+  .qc-message-reference-tags { width: 100%; margin-left: 0; }
+  .qc-form-field { grid-template-columns: 1fr; gap: 2px; }
+}

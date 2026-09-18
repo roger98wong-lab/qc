@@ -1,0 +1,30 @@
+{
+  "name": "qc-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test:workflow-contract": "tsc -p tsconfig.contract.json && node .contract-test/mocks/workflowMock.test.js",
+    "test:transfer-form-display": "tsc --target ES2020 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --outDir .contract-test --rootDir src src/components/conversationDisplay.ts src/mocks/conversationDisplay.test.ts && node .contract-test/mocks/conversationDisplay.test.js"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2",
+    "antd": "^5.21.5",
+    "@ant-design/icons": "^5.5.1",
+    "axios": "^1.7.7",
+    "dayjs": "^1.11.13",
+    "zustand": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

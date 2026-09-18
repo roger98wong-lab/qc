@@ -1,0 +1,31 @@
+# secrets and local data
+backend/.env
+backend/qc.db
+backend/qc.db.*
+backend/backups/
+backend/uploads/
+backend/uploads_runtime/
+backend/reports/
+backend/reports_runtime/
+
+# logs and scratch
+*.log
+_tmp_*.py
+_fix_*.py
+analyzing-laptop.png
+.ui-review/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.corrupt-backup-*
+*.recursive-loader-backup-*
+
+# frontend
+frontend/node_modules/
+frontend/.contract-test/
+
+# OS
+Thumbs.db
+Desktop.ini
