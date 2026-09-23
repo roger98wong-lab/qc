@@ -5,7 +5,8 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, load_only
 
 from auth import get_current_user
 from database import (
@@ -58,7 +59,14 @@ def _parse_day(value: Optional[str], field_name: str, fallback: date):
 
 def _latest_assignments(db: Session):
     result = {}
-    for row in db.query(ReviewAssignment).order_by(ReviewAssignment.id.desc()).all():
+    rows = db.query(ReviewAssignment).options(
+        load_only(
+            ReviewAssignment.id, ReviewAssignment.item_type, ReviewAssignment.item_id,
+            ReviewAssignment.assignee_id, ReviewAssignment.status, ReviewAssignment.review_decision,
+            ReviewAssignment.completed_at,
+        )
+    ).order_by(ReviewAssignment.id.desc()).all()
+    for row in rows:
         result.setdefault((row.item_type, row.item_id), row)
     return result
 
@@ -75,14 +83,26 @@ def _scope_assignment(assignment, user: User, assignee_id: Optional[int]):
 def _source_rows(db: Session, user: User, assignee_id: Optional[int]):
     assignments = _latest_assignments(db)
     rows = []
-    issue_query = db.query(QcSliceQualityIssue, QcSlice).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+    issue_query = db.query(QcSliceQualityIssue, QcSlice).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).options(
+        load_only(QcSliceQualityIssue.id, QcSliceQualityIssue.slice_id, QcSliceQualityIssue.is_primary),
+        load_only(QcSlice.id, QcSlice.analysis_status),
+    ).filter(
         QcSliceQualityIssue.is_primary.is_(True), QcSlice.analysis_status.in_(ACTIVE_ANALYSES),
     )
     for issue, slice_row in issue_query.all():
         assignment = assignments.get(("quality_issue", issue.id))
         if _scope_assignment(assignment, user, assignee_id):
             rows.append(("quality_issue", issue, slice_row, assignment))
-    knowledge_query = db.query(QcSliceKnowledgeSuggestion, QcSlice).join(QcSlice, QcSliceKnowledgeSuggestion.slice_id == QcSlice.id).filter(
+    knowledge_query = db.query(QcSliceKnowledgeSuggestion, QcSlice).join(QcSlice, QcSliceKnowledgeSuggestion.slice_id == QcSlice.id).options(
+        load_only(
+            QcSliceKnowledgeSuggestion.id, QcSliceKnowledgeSuggestion.slice_id,
+            QcSliceKnowledgeSuggestion.decision, QcSliceKnowledgeSuggestion.answer_source,
+            QcSliceKnowledgeSuggestion.processing_status, QcSliceKnowledgeSuggestion.human_qa_pairs,
+            QcSliceKnowledgeSuggestion.human_standard_questions, QcSliceKnowledgeSuggestion.human_standard_answer,
+            QcSliceKnowledgeSuggestion.standard_questions, QcSliceKnowledgeSuggestion.standard_answer,
+        ),
+        load_only(QcSlice.id, QcSlice.analysis_status),
+    ).filter(
         QcSliceKnowledgeSuggestion.decision.in_(ACTIONABLE_KNOWLEDGE_DECISIONS),
         QcSlice.analysis_status.in_(ACTIVE_ANALYSES),
     )
@@ -108,8 +128,10 @@ def _case_statuses(rows):
 
 def _entry_statuses(db: Session):
     result = {}
-    for entry in db.query(QAPoolEntry).filter(QAPoolEntry.source_pair_active.is_(True)).all():
-        result[(entry.qa_source, entry.source_item_id, entry.qa_index)] = entry.processing_status or "pending_entry"
+    for qa_source, source_item_id, qa_index, processing_status in db.query(
+        QAPoolEntry.qa_source, QAPoolEntry.source_item_id, QAPoolEntry.qa_index, QAPoolEntry.processing_status
+    ).filter(QAPoolEntry.source_pair_active.is_(True)).all():
+        result[(qa_source, source_item_id, qa_index)] = processing_status or "pending_entry"
     return result
 
 
@@ -117,7 +139,14 @@ def _pending_qa_counts(db: Session, user: User, assignee_id: Optional[int], sour
     """Count active QA pairs without writing/materializing pool rows."""
     statuses = _entry_statuses(db)
     case_pending = knowledge_pending = 0
-    reviewer_query = db.query(QcSliceQualityIssue, QcSlice).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+    reviewer_query = db.query(QcSliceQualityIssue, QcSlice).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).options(
+        load_only(
+            QcSliceQualityIssue.id, QcSliceQualityIssue.qa_source, QcSliceQualityIssue.knowledge_pool_status,
+            QcSliceQualityIssue.human_qa_pairs, QcSliceQualityIssue.human_standard_questions,
+            QcSliceQualityIssue.human_standard_answer,
+        ),
+        load_only(QcSlice.id, QcSlice.analysis_status),
+    ).filter(
         QcSliceQualityIssue.qa_source == "quality_reviewer",
         QcSliceQualityIssue.knowledge_pool_status.isnot(None),
         QcSlice.analysis_status.in_(ACTIVE_ANALYSES),
@@ -161,7 +190,12 @@ def _tag_metrics(db: Session, user: User, assignee_id: Optional[int], start_day:
     tagged_cases = 0
     start_dt = datetime.combine(start_day, datetime.min.time())
     end_dt = datetime.combine(end_day + timedelta(days=1), datetime.min.time())
-    rows = db.query(QcSliceQualityIssue).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+    rows = db.query(QcSliceQualityIssue).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).options(
+        load_only(
+            QcSliceQualityIssue.id, QcSliceQualityIssue.human_tags_json,
+            QcSliceQualityIssue.human_updated_at, QcSliceQualityIssue.created_at,
+        )
+    ).filter(
         QcSliceQualityIssue.is_primary.is_(True),
         QcSlice.analysis_status.in_(ACTIVE_ANALYSES),
     ).all()
@@ -189,9 +223,10 @@ def _tag_metrics(db: Session, user: User, assignee_id: Optional[int], start_day:
 def _top_handler(db: Session, user: User, assignee_id: Optional[int], start_day: date, end_day: date):
     start_dt = datetime.combine(start_day, datetime.min.time())
     end_dt = datetime.combine(end_day + timedelta(days=1), datetime.min.time())
-    names = {row.id: row.username for row in db.query(User).all()}
     counts = Counter()
-    query = db.query(ReviewAssignment).filter(
+    query = db.query(User.username, func.count(ReviewAssignment.id)).join(
+        ReviewAssignment, ReviewAssignment.assignee_id == User.id
+    ).filter(
         ReviewAssignment.status == "completed",
         ReviewAssignment.completed_at.isnot(None),
         ReviewAssignment.completed_at >= start_dt,
@@ -201,10 +236,9 @@ def _top_handler(db: Session, user: User, assignee_id: Optional[int], start_day:
         query = query.filter(ReviewAssignment.assignee_id == user.id)
     elif assignee_id is not None:
         query = query.filter(ReviewAssignment.assignee_id == assignee_id)
-    for assignment in query.all():
-        name = names.get(assignment.assignee_id)
+    for name, count in query.group_by(User.username).all():
         if name:
-            counts[name] += 1
+            counts[name] = int(count or 0)
     if not counts:
         return {"name": None, "count": 0}
     name, count = sorted(counts.items(), key=lambda row: (-row[1], row[0]))[0]

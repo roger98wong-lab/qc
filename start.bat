@@ -5,8 +5,12 @@ title QC system launcher
 
 set "PROJECT_ROOT=%~dp0"
 set "BACKEND_DIR=%PROJECT_ROOT%backend"
-set "PYTHON_EXE=%PROJECT_ROOT%..\.venv\Scripts\python.exe"
-if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
+set "PYTHON_EXE=%PROJECT_ROOT%.venv\Scripts\python.exe"
+if not exist "%PYTHON_EXE%" (
+    echo WARNING: project venv not found at "%PROJECT_ROOT%.venv\Scripts\python.exe"
+    echo Falling back to system python.
+    set "PYTHON_EXE=python"
+)
 
 if not exist "%BACKEND_DIR%\main.py" (
     echo ERROR: backend entrypoint not found.

@@ -29,6 +29,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
   }, [token])
   if (!token) return <Navigate to="/login" replace />
   if (checking || !user) return <div style={{ minHeight: 240, display: 'grid', placeItems: 'center' }}><Spin tip="正在验证登录状态" /></div>
+  if (user.must_change_password) return <Navigate to="/login" replace />
   return <>{children}</>
 }
 

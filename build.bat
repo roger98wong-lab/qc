@@ -3,8 +3,12 @@ chcp 65001 > nul
 title 构建前端
 
 echo 正在构建前端界面...
-cd /d E:\qc_system\frontend
-call "C:\Program Files\nodejs\npm.cmd" run build
+cd /d "%~dp0frontend"
+if exist "C:\Program Files\nodejs\npm.cmd" (
+    call "C:\Program Files\nodejs\npm.cmd" run build
+) else (
+    call npm.cmd run build
+)
 
 echo.
 if %ERRORLEVEL% == 0 (

@@ -306,6 +306,31 @@ def release(assignment_id: int, user=Depends(get_current_user), db: Session = De
     return _serialize(db, row)
 
 
+def force_release_row(db: Session, row: ReviewAssignment, admin: User, reason: str) -> bool:
+    """Cancel one unfinished assignment using the existing force-release audit trail."""
+    if row.status not in ACTIVE:
+        return False
+    previous = row.assignee_id
+    row.status = "cancelled"
+    row.returned_reason = reason
+    _log(db, row, "force_released", admin, old=previous, note=reason)
+    record_audit(db, "force_released", row.item_type, row.item_id, user=admin, from_value=str(previous), to_value="unassigned", reason=reason)
+    return True
+
+
+def force_release_user_open_assignments(db: Session, user_id: int, admin: User, reason: str) -> int:
+    """Release unfinished tasks only; completed/cancelled rows stay untouched."""
+    rows = db.query(ReviewAssignment).filter(
+        ReviewAssignment.assignee_id == user_id,
+        ReviewAssignment.status.in_(ACTIVE),
+    ).all()
+    released = 0
+    for row in rows:
+        if force_release_row(db, row, admin, reason):
+            released += 1
+    return released
+
+
 @router.post("/{assignment_id}/force-release")
 def force_release(assignment_id: int, data: dict, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     row = db.query(ReviewAssignment).filter(ReviewAssignment.id == assignment_id).first()
@@ -314,11 +339,7 @@ def force_release(assignment_id: int, data: dict, admin: User = Depends(require_
     if row.status not in ACTIVE:
         raise HTTPException(400, "该问题当前没有可释放的处理锁")
     reason = str(data.get("reason") or "").strip() or "管理员强制释放"
-    previous = row.assignee_id
-    row.status = "cancelled"
-    row.returned_reason = reason
-    _log(db, row, "force_released", admin, old=previous)
-    record_audit(db, "force_released", row.item_type, row.item_id, user=admin, from_value=str(previous), to_value="unassigned", reason=reason)
+    force_release_row(db, row, admin, reason)
     db.commit()
     return _serialize(db, row)
 

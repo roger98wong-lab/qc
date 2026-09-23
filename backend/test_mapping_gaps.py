@@ -23,5 +23,30 @@ class MappingGapLogicTest(unittest.TestCase):
         self.assertEqual(admin_router._norm_channel("官网客服"), "官网客服")
 
 
+class MappingPrepareTest(unittest.TestCase):
+    def test_prepare_game_product_clears_raw_region(self):
+        payload = admin_router._prepare_mapping_fields({
+            "raw_region": "欧美",
+            "raw_channel": "官网客服",
+            "game": "勇者联盟",
+            "match_field": "gameProductId",
+            "match_value": "1779344175941",
+            "target_channel": "官网客服",
+            "target_region": "欧美",
+            "enabled": True,
+        })
+        self.assertIsNone(payload["raw_region"])
+        self.assertEqual(payload["match_value"], "1779344175941")
+
+    def test_prepare_other_fields_keep_raw_region(self):
+        payload = admin_router._prepare_mapping_fields({
+            "raw_region": "英语区",
+            "raw_channel": "DC",
+            "match_field": "none",
+            "target_channel": "DC",
+        })
+        self.assertEqual(payload["raw_region"], "英语区")
+
+
 if __name__ == "__main__":
     unittest.main()

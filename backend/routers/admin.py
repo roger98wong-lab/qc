@@ -8,13 +8,24 @@ import subprocess
 import sys
 import threading
 import re
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from datetime import datetime
-from database import (get_db, User, MappingConfig, QcSlice, AnalysisBatch,
-                      QcSliceQualityIssue, QcSliceKnowledgeSuggestion, Session, utcnow)
+import io
+from fastapi.responses import Response
+from sqlalchemy import case, or_, text, update
+from database import (get_db, User, MappingConfig, GameAiConfig, QcSlice, AnalysisBatch,
+                      QcSliceQualityIssue, QcSliceKnowledgeSuggestion, Session, utcnow,
+                      AuditLog, QcIssue, KbSuggestion)
+from services.game_ai_config import serialize_config as serialize_game_ai_config
+from sqlalchemy.exc import IntegrityError
 from auth import require_admin
 from config import BACKUP_DIR, DB_PATH
 from services.maas_client import is_maas_configured
+from audit import (
+    ACTION_LABELS, TARGET_TYPE_LABELS, AuditQueryError, audit_log_query,
+    record_audit, resolve_audit_window, serialize_audit_logs, action_label,
+    target_type_label,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["管理"])
 
@@ -176,6 +187,88 @@ def _admin_slice_dict(slice_row, session, issues, knowledge):
         "completed_at": slice_row.completed_at.isoformat() if slice_row.completed_at else None,
         "session_uid": session.session_uid if session else None, "session_link": session.session_link if session else None,
     }
+
+
+
+def _audit_window_or_400(start: datetime | None, end: datetime | None):
+    try:
+        return resolve_audit_window(start, end)
+    except AuditQueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _display(value):
+    text = "" if value is None else str(value).strip()
+    return text or "—"
+
+
+@router.get("/audit-logs/options", summary="操作日志筛选项")
+def audit_log_options(admin: User = Depends(require_admin), db=Depends(get_db)):
+    start, end = resolve_audit_window(None, None)
+    rows = db.query(AuditLog.action, AuditLog.target_type).filter(
+        AuditLog.created_at >= start, AuditLog.created_at <= end,
+    ).distinct().all()
+    actions = {key: ACTION_LABELS[key] for key in ACTION_LABELS}
+    target_types = {key: TARGET_TYPE_LABELS[key] for key in TARGET_TYPE_LABELS}
+    for action, target_type in rows:
+        if action and action not in actions:
+            actions[action] = action_label(action)
+        if target_type and target_type not in target_types:
+            target_types[target_type] = target_type_label(target_type)
+    operators = [
+        {"id": user.id, "username": user.username, "role": user.role}
+        for user in db.query(User).order_by(User.id).all()
+    ]
+    return {
+        "actions": [{"value": key, "label": actions[key]} for key in sorted(actions, key=lambda item: actions[item])],
+        "target_types": [{"value": key, "label": target_types[key]} for key in sorted(target_types, key=lambda item: target_types[item])],
+        "operators": operators,
+    }
+
+
+@router.get("/audit-logs", summary="查询操作日志")
+def list_audit_logs(start: datetime | None = None, end: datetime | None = None,
+                    operator_id: int | None = None, action: str | None = None,
+                    target_type: str | None = None, page: int = 1, page_size: int = 20,
+                    admin: User = Depends(require_admin), db=Depends(get_db)):
+    start, end = _audit_window_or_400(start, end)
+    safe_page = max(1, page or 1)
+    safe_page_size = 50 if page_size == 50 else 20
+    query = audit_log_query(db, start, end, operator_id, action, target_type)
+    total = query.count()
+    rows = query.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    return {"items": serialize_audit_logs(db, rows), "total": total, "page": safe_page, "page_size": safe_page_size}
+
+
+@router.get("/audit-logs/export", summary="导出操作日志")
+def export_audit_logs(start: datetime | None = None, end: datetime | None = None,
+                      operator_id: int | None = None, action: str | None = None,
+                      target_type: str | None = None,
+                      admin: User = Depends(require_admin), db=Depends(get_db)):
+    start, end = _audit_window_or_400(start, end)
+    rows = audit_log_query(db, start, end, operator_id, action, target_type).all()
+    items = serialize_audit_logs(db, rows)
+    import pandas as pd
+    table = [{
+        "时间": _display(item["created_at"]),
+        "操作人": _display(item["operator_name"]),
+        "动作": _display(item["action_label"] or item["action"]),
+        "对象": _display(item["target_label"]),
+        "改前": _display(item["from_value"]),
+        "改后": _display(item["to_value"]),
+        "原因": _display(item["reason"]),
+    } for item in items]
+    buf = io.BytesIO()
+    pd.DataFrame(table, columns=["时间", "操作人", "动作", "对象", "改前", "改后", "原因"]).to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    record_audit(db, "export_logs", "audit_logs", None, user=admin, reason="导出操作日志")
+    db.commit()
+    fname = f"操作日志_{utcnow():%Y%m%d_%H%M%S}.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @router.get("/audit/slices", summary="管理员查看全部切片分析")
@@ -367,6 +460,33 @@ def list_backups(admin: User = Depends(require_admin)):
                             "modified_at": datetime.fromtimestamp(os.path.getmtime(fp)).isoformat()})
     return result
 
+
+def _is_pending_mapping(row):
+    return (not bool(row.enabled)) and str(row.remark or "").startswith(PENDING_MAPPING_PREFIX)
+
+
+def _can_enable_mapping(row):
+    if (row.match_field or "none") == "gameProductId" and (row.raw_channel or "") == "官网客服":
+        game_name = str(row.game or "").strip()
+        if not game_name or DIGIT_GAME.match(game_name):
+            return False, "官网客服游戏产品 ID 映射启用前必须填写游戏名，且不能仍是数字 ID"
+    return True, ""
+
+
+def _apply_mapping_enabled(row, enabled: bool):
+    if bool(row.enabled) is bool(enabled):
+        return "skipped", "已是启用状态" if enabled else "已是停用状态"
+    if enabled:
+        if _is_pending_mapping(row):
+            return "skipped", "请先编辑补全后再启用"
+        ok, reason = _can_enable_mapping(row)
+        if not ok:
+            return "failed", reason
+        row.enabled = True
+        return "enabled", ""
+    row.enabled = False
+    return "disabled", ""
+
 @router.get("/mappings")
 def list_mappings(raw_region: str | None = None, raw_channel: str | None = None,
                   game: str | None = None, match_field: str | None = None,
@@ -520,9 +640,158 @@ def create_mapping_drafts(data: dict, db=Depends(get_db), admin: User = Depends(
     return {"created": created, "skipped": skipped, "total": len(gaps), "pending_count": _pending_query(db).count()}
 
 
+MAPPING_FIELDS = [
+    "raw_region", "raw_channel", "game", "match_field", "match_value",
+    "target_channel", "target_region", "enabled", "remark",
+]
+PROTECTED_CHANNELS = ("DC", "FB", "LINE", "VK", "M后台")
+
+
+def _is_game_product_field(value) -> bool:
+    return str(value or "none").strip() == "gameProductId"
+
+
+def _prepare_mapping_fields(data: dict, existing=None) -> dict:
+    prepared = {}
+    for key in MAPPING_FIELDS:
+        if key in data:
+            prepared[key] = data[key]
+    match_field = prepared.get("match_field", getattr(existing, "match_field", None))
+    if _is_game_product_field(match_field):
+        prepared["raw_region"] = None
+    return prepared
+
+
+def _channel_follows_rule(column, raw_channel):
+    text = str(raw_channel or "").strip()
+    if not text:
+        return True
+    return or_(column == text, column.startswith(f"{text}-"))
+
+
+def _channel_rewrite_expr(column, target_channel):
+    target = str(target_channel or "").strip()
+    if not target:
+        return column
+    protected = [column == name for name in PROTECTED_CHANNELS]
+    protected.extend(column.startswith(f"{name}-") for name in PROTECTED_CHANNELS)
+    return case(
+        (column == "官网客服", column),
+        (or_(*protected), column),
+        else_=target,
+    )
+
+
+def _collect_enabled_game_product_rules(db, match_values=None):
+    query = db.query(MappingConfig).filter(
+        MappingConfig.enabled.is_(True),
+        MappingConfig.match_field == "gameProductId",
+        MappingConfig.match_value.isnot(None),
+        MappingConfig.match_value != "",
+        MappingConfig.game.isnot(None),
+        MappingConfig.game != "",
+    )
+    requested = None
+    if match_values is not None:
+        requested = []
+        seen = set()
+        for item in match_values:
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                requested.append(value)
+        if not requested:
+            return []
+        query = query.filter(MappingConfig.match_value.in_(requested))
+    rows = query.order_by(MappingConfig.id).all()
+    chosen = {}
+    for row in rows:
+        product_id = str(row.match_value or "").strip()
+        if not product_id or product_id in chosen:
+            continue
+        chosen[product_id] = row
+    if requested is not None:
+        return [chosen[value] for value in requested if value in chosen]
+    return list(chosen.values())
+
+
+def _count_and_update_game_region(db, model, product_id, new_game, new_region, channel_clause, channel_expr=None):
+    filters = [model.game == product_id]
+    if channel_clause is not True:
+        filters.append(channel_clause)
+    query = db.query(model).filter(*filters)
+    scanned = query.count()
+    if not scanned:
+        return 0, 0, 0, 0
+    new_region_text = "" if new_region is None else str(new_region)
+    games_changed = scanned if str(product_id) != str(new_game or "") else 0
+    region_rows = query.with_entities(model.region).all()
+    regions_changed = 0
+    for (current,) in region_rows:
+        current_text = "" if current is None else str(current)
+        if current_text != new_region_text:
+            regions_changed += 1
+    values = {"game": new_game, "region": new_region}
+    if channel_expr is not None:
+        values["channel"] = channel_expr
+    result = db.execute(update(model).where(*filters).values(**values))
+    updated = result.rowcount if result.rowcount is not None and result.rowcount >= 0 else scanned
+    return scanned, updated, games_changed, regions_changed
+
+
+def apply_enabled_game_product_mappings(db, match_values=None):
+    rules = _collect_enabled_game_product_rules(db, match_values)
+    summary = {
+        "match_values": [str(row.match_value).strip() for row in rules],
+        "slices_scanned": 0,
+        "slices_updated": 0,
+        "sessions_updated": 0,
+        "issues_updated": 0,
+        "kb_updated": 0,
+        "games_changed": 0,
+        "regions_changed": 0,
+    }
+    if not rules:
+        return summary
+    db.execute(text("PRAGMA busy_timeout=60000"))
+    for row in rules:
+        product_id = str(row.match_value).strip()
+        new_game = str(row.game or "").strip()
+        new_region = row.target_region
+        slice_channel = _channel_follows_rule(QcSlice.channel, row.raw_channel)
+        session_channel = _channel_follows_rule(Session.channel, row.raw_channel)
+        issue_channel = _channel_follows_rule(QcIssue.channel, row.raw_channel)
+        kb_channel = _channel_follows_rule(KbSuggestion.channel, row.raw_channel)
+        slice_channel_expr = _channel_rewrite_expr(QcSlice.channel, row.target_channel)
+        session_channel_expr = _channel_rewrite_expr(Session.channel, row.target_channel)
+        issue_channel_expr = _channel_rewrite_expr(QcIssue.channel, row.target_channel)
+        kb_channel_expr = _channel_rewrite_expr(KbSuggestion.channel, row.target_channel)
+        scanned, updated, games_changed, regions_changed = _count_and_update_game_region(
+            db, QcSlice, product_id, new_game, new_region, slice_channel, slice_channel_expr,
+        )
+        summary["slices_scanned"] += scanned
+        summary["slices_updated"] += updated
+        summary["games_changed"] += games_changed
+        summary["regions_changed"] += regions_changed
+        _, sessions_updated, _, _ = _count_and_update_game_region(
+            db, Session, product_id, new_game, new_region, session_channel, session_channel_expr,
+        )
+        summary["sessions_updated"] += sessions_updated
+        _, issues_updated, _, _ = _count_and_update_game_region(
+            db, QcIssue, product_id, new_game, new_region, issue_channel, issue_channel_expr,
+        )
+        summary["issues_updated"] += issues_updated
+        _, kb_updated, _, _ = _count_and_update_game_region(
+            db, KbSuggestion, product_id, new_game, new_region, kb_channel, kb_channel_expr,
+        )
+        summary["kb_updated"] += kb_updated
+    return summary
+
+
 @router.post("/mappings")
 def create_mapping(data: dict, db=Depends(get_db), admin: User = Depends(require_admin)):
-    x = MappingConfig(**{k: data.get(k) for k in ["raw_region","raw_channel","game","match_field","match_value","target_channel","target_region","enabled","remark"] if k in data})
+    payload = _prepare_mapping_fields(data)
+    x = MappingConfig(**payload)
     if not x.target_channel: raise HTTPException(400, "target_channel required")
     db.add(x); db.commit(); db.refresh(x); return {"id": x.id}
 
@@ -530,17 +799,227 @@ def create_mapping(data: dict, db=Depends(get_db), admin: User = Depends(require
 def update_mapping(mapping_id: int, data: dict, db=Depends(get_db), admin: User = Depends(require_admin)):
     x = db.query(MappingConfig).filter(MappingConfig.id == mapping_id).first()
     if not x: raise HTTPException(404, "mapping not found")
-    for k in ["raw_region","raw_channel","game","match_field","match_value","target_channel","target_region","enabled","remark"]:
-        if k in data: setattr(x, k, data[k])
-    enabling = bool(x.enabled)
-    if enabling and (x.match_field or "none") == "gameProductId" and (x.raw_channel or "") == "官网客服":
-        game_name = str(x.game or "").strip()
-        if not game_name or DIGIT_GAME.match(game_name):
-            raise HTTPException(400, "官网客服游戏产品 ID 映射启用前必须填写游戏名，且不能仍是数字 ID")
+    payload = _prepare_mapping_fields(data, x)
+    for k, value in payload.items():
+        setattr(x, k, value)
+    if bool(x.enabled):
+        still_pending = str(x.remark or "").startswith(PENDING_MAPPING_PREFIX)
+        if still_pending:
+            raise HTTPException(400, "请先编辑补全后再启用")
+        ok, reason = _can_enable_mapping(x)
+        if not ok:
+            raise HTTPException(400, reason)
     db.commit(); return {"message": "updated"}
+
+
+@router.post("/mappings/apply-game-product-ids")
+def apply_game_product_ids(data: dict | None = Body(default=None), db=Depends(get_db), admin: User = Depends(require_admin)):
+    payload = data or {}
+    match_values = payload.get("match_values")
+    if match_values is not None and not isinstance(match_values, list):
+        raise HTTPException(400, "match_values 必须是字符串数组")
+    try:
+        summary = apply_enabled_game_product_mappings(db, match_values)
+        record_audit(
+            db,
+            "apply_game_product_mappings",
+            "mapping_config",
+            None,
+            user=admin,
+            reason=(
+                f"产品ID {len(summary['match_values'])} 个，"
+                f"切片扫描 {summary['slices_scanned']}，切片更新 {summary['slices_updated']}，"
+                f"会话 {summary['sessions_updated']}，问题 {summary['issues_updated']}，"
+                f"知识库 {summary['kb_updated']}，"
+                f"游戏名 {summary['games_changed']}，地区 {summary['regions_changed']}"
+            ),
+        )
+        db.commit()
+        return summary
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(500, f"回写失败: {exc}") from exc
+
+
+@router.post("/mappings/batch-enabled")
+def batch_set_mapping_enabled(data: dict, db=Depends(get_db), admin: User = Depends(require_admin)):
+    ids = data.get("ids")
+    enabled = data.get("enabled")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "ids 必须是非空数组")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled 必须是布尔值")
+    normalized = []
+    seen = set()
+    for item in ids:
+        try:
+            mapping_id = int(item)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "ids 必须是整数数组")
+        if mapping_id not in seen:
+            seen.add(mapping_id)
+            normalized.append(mapping_id)
+    results = []
+    success_count = skipped_count = failed_count = 0
+    for mapping_id in normalized:
+        row = db.query(MappingConfig).filter(MappingConfig.id == mapping_id).first()
+        if not row:
+            failed_count += 1
+            results.append({"id": mapping_id, "success": False, "skipped": False, "reason": "映射不存在"})
+            continue
+        status, reason = _apply_mapping_enabled(row, enabled)
+        if status == "skipped":
+            skipped_count += 1
+            results.append({"id": mapping_id, "success": False, "skipped": True, "reason": reason})
+        elif status in {"enabled", "disabled"}:
+            success_count += 1
+            results.append({"id": mapping_id, "success": True, "skipped": False, "status": status})
+        else:
+            failed_count += 1
+            results.append({"id": mapping_id, "success": False, "skipped": False, "reason": reason})
+    db.commit()
+    return {
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "results": results,
+    }
 
 @router.delete("/mappings/{mapping_id}")
 def delete_mapping(mapping_id: int, db=Depends(get_db), admin: User = Depends(require_admin)):
     x = db.query(MappingConfig).filter(MappingConfig.id == mapping_id).first()
     if not x: raise HTTPException(404, "mapping not found")
     db.delete(x); db.commit(); return {"message": "deleted"}
+
+
+
+def _norm_ai_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _bool_or_400(value, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1, "0", "1", "true", "false", "True", "False"):
+        return value in (True, 1, "1", "true", "True")
+    raise HTTPException(400, f"{field} 必须是布尔值")
+
+
+def _prepare_game_ai_fields(data: dict, existing=None) -> dict:
+    payload = {}
+    game = data.get("game", getattr(existing, "game", None))
+    region = data.get("region", getattr(existing, "region", None))
+    game = _norm_ai_text(game)
+    region = _norm_ai_text(region)
+    if not game:
+        raise HTTPException(400, "标准游戏不能为空")
+    if not region:
+        raise HTTPException(400, "标准地区不能为空")
+    payload["game"] = game
+    payload["region"] = region
+    if existing is None or "analysis_enabled" in data:
+        payload["analysis_enabled"] = _bool_or_400(data.get("analysis_enabled", False), "analysis_enabled") if existing is None else _bool_or_400(data["analysis_enabled"], "analysis_enabled")
+    if existing is None or "enabled" in data:
+        default_enabled = True if existing is None else existing.enabled
+        payload["enabled"] = _bool_or_400(data.get("enabled", default_enabled), "enabled")
+    return payload
+
+
+@router.get("/game-ai-configs")
+def list_game_ai_configs(game: str | None = None, region: str | None = None,
+                         analysis_enabled: bool | None = None, enabled: bool | None = None,
+                         page: int | None = None, page_size: int | None = None,
+                         db=Depends(get_db), admin: User = Depends(require_admin)):
+    """List AI analysis switches. Saving never rewrites historical slices."""
+    query = db.query(GameAiConfig)
+    if game:
+        query = query.filter(GameAiConfig.game.contains(game.strip()))
+    if region:
+        query = query.filter(GameAiConfig.region == region.strip())
+    if analysis_enabled is not None:
+        query = query.filter(GameAiConfig.analysis_enabled == analysis_enabled)
+    if enabled is not None:
+        query = query.filter(GameAiConfig.enabled == enabled)
+    ordered = query.order_by(GameAiConfig.region, GameAiConfig.game, GameAiConfig.id)
+
+    def serialize(row):
+        return serialize_game_ai_config(row)
+
+    if page is None and page_size is None:
+        return [serialize(row) for row in ordered.all()]
+    safe_page = max(1, page or 1)
+    safe_page_size = min(100, max(1, page_size or 20))
+    total = query.count()
+    rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    return {"items": [serialize(row) for row in rows], "total": total,
+            "page": safe_page, "page_size": safe_page_size}
+
+
+@router.get("/game-ai-configs/options")
+def game_ai_config_options(db=Depends(get_db), admin: User = Depends(require_admin)):
+    def values(column):
+        rows = db.query(column).filter(column.isnot(None), column != "").distinct().order_by(column).all()
+        return [row[0] for row in rows]
+    games = sorted(set(values(GameAiConfig.game) + values(MappingConfig.game)))
+    regions = sorted(set(values(GameAiConfig.region) + values(MappingConfig.target_region)))
+    return {
+        "games": games,
+        "regions": regions,
+        "analysis_statuses": [{"value": True, "label": "开启"}, {"value": False, "label": "关闭"}],
+        "statuses": [{"value": True, "label": "启用"}, {"value": False, "label": "停用"}],
+    }
+
+
+@router.post("/game-ai-configs")
+def create_game_ai_config(data: dict, db=Depends(get_db), admin: User = Depends(require_admin)):
+    payload = _prepare_game_ai_fields(data)
+    row = GameAiConfig(**payload)
+    db.add(row)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "同一标准游戏 + 标准地区只能有一条 AI 配置")
+    record_audit(db, "created", "game_ai_config", row.id, user=admin,
+                 to_value=f"{row.game}/{row.region} analysis={row.analysis_enabled} enabled={row.enabled}",
+                 reason="新增游戏 AI 分析配置，不影响历史切片")
+    db.commit(); db.refresh(row)
+    return serialize_game_ai_config(row)
+
+
+@router.put("/game-ai-configs/{config_id}")
+def update_game_ai_config(config_id: int, data: dict, db=Depends(get_db), admin: User = Depends(require_admin)):
+    row = db.query(GameAiConfig).filter(GameAiConfig.id == config_id).first()
+    if not row:
+        raise HTTPException(404, "AI 配置不存在")
+    before = f"{row.game}/{row.region} analysis={row.analysis_enabled} enabled={row.enabled}"
+    payload = _prepare_game_ai_fields(data, row)
+    for key, value in payload.items():
+        setattr(row, key, value)
+    row.updated_at = utcnow()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "同一标准游戏 + 标准地区只能有一条 AI 配置")
+    after = f"{row.game}/{row.region} analysis={row.analysis_enabled} enabled={row.enabled}"
+    record_audit(db, "updated", "game_ai_config", row.id, user=admin,
+                 from_value=before, to_value=after, reason="修改游戏 AI 分析配置，不重跑历史分析")
+    db.commit(); db.refresh(row)
+    return serialize_game_ai_config(row)
+
+
+@router.delete("/game-ai-configs/{config_id}")
+def delete_game_ai_config(config_id: int, db=Depends(get_db), admin: User = Depends(require_admin)):
+    row = db.query(GameAiConfig).filter(GameAiConfig.id == config_id).first()
+    if not row:
+        raise HTTPException(404, "AI 配置不存在")
+    before = f"{row.game}/{row.region} analysis={row.analysis_enabled} enabled={row.enabled}"
+    db.delete(row)
+    record_audit(db, "deleted", "game_ai_config", config_id, user=admin,
+                 from_value=before, reason="删除游戏 AI 分析配置，不修改历史切片")
+    db.commit()
+    return {"message": "deleted"}

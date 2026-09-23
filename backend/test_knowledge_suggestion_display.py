@@ -9,6 +9,8 @@ os.chdir(ROOT / "backend")
 
 from routers.workbench import ACTIONABLE_KB, _human_agent_name, _kb_list_decisions, _last_modified_at, _matches, _normalize_kb_decisions, _session_time, _slice_language
 from routers import review_processing as review_router
+from routers import admin as admin_router
+
 from routers import assignments as assignment_router
 
 from routers.knowledge_pool import _serialize as serialize_pool
@@ -230,6 +232,18 @@ class KnowledgeSuggestionDisplayTest(unittest.TestCase):
         self.assertEqual(_last_modified_at(item, assignment), "2026-09-17 19:00:00")
         self.assertEqual(_last_modified_at(item, None), "2026-09-17 18:00:00")
         self.assertIsNone(_last_modified_at(SimpleNamespace(human_updated_at=None), None))
+
+    def test_mapping_batch_enable_skips_pending_and_already_enabled(self):
+        pending = SimpleNamespace(id=1, enabled=False, remark="[待补充映射] 标准渠道", match_field="none", raw_channel="DC", game="冒险大作战")
+        enabled = SimpleNamespace(id=2, enabled=True, remark="", match_field="none", raw_channel="DC", game="冒险大作战")
+        disabled = SimpleNamespace(id=3, enabled=False, remark="", match_field="none", raw_channel="DC", game="冒险大作战")
+        illegal = SimpleNamespace(id=4, enabled=False, remark="", match_field="gameProductId", raw_channel="官网客服", game="1741860167481")
+        self.assertEqual(admin_router._apply_mapping_enabled(pending, True)[0], "skipped")
+        self.assertEqual(admin_router._apply_mapping_enabled(enabled, True)[0], "skipped")
+        self.assertEqual(admin_router._apply_mapping_enabled(disabled, True)[0], "enabled")
+        self.assertTrue(disabled.enabled)
+        self.assertEqual(admin_router._apply_mapping_enabled(illegal, True)[0], "failed")
+        self.assertEqual(admin_router._apply_mapping_enabled(SimpleNamespace(id=5, enabled=False, remark=""), False)[0], "skipped")
 
     def test_admin_unassigned_cannot_edit(self):
         # Mirrors Report.tsx canEdit: lock + owner required, including admin.

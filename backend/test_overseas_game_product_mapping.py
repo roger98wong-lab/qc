@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 os.chdir(ROOT / "backend")
 
 from database import OVERSEAS_GAME_PRODUCT_MAPPINGS
-from services.excel_parser import _apply_mapping, _cell_text, _parse_overseas
+from services.excel_parser import _apply_mapping, _cell_text, _force_mushroom_rush_to_sea_adventure, _parse_overseas
 
 
 def _rule(**kwargs):
@@ -28,6 +28,26 @@ def _rule(**kwargs):
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
+
+
+class MushroomRushAliasTest(unittest.TestCase):
+    def test_force_rewrites_to_sea_adventure(self):
+        game, region = _force_mushroom_rush_to_sea_adventure("Mushroom Rush", "英语区")
+        self.assertEqual(game, "冒险大作战")
+        self.assertEqual(region, "东南亚")
+        game, region = _force_mushroom_rush_to_sea_adventure("mushroom rush", None)
+        self.assertEqual((game, region), ("冒险大作战", "东南亚"))
+
+    def test_apply_mapping_does_not_rewrite_mushroom_rush_game(self):
+        rows = [
+            _rule(raw_region="英语区", raw_channel="DC", match_field="none", game=None, match_value=None, target_channel="DC", target_region="欧美"),
+        ]
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("英语区", "DC", "Mushroom Rush", "", "hello")
+        self.assertEqual(channel, "DC")
+        self.assertEqual(region, "欧美")
+        self.assertIsNone(game)
 
 
 class CellTextProductIdTest(unittest.TestCase):
@@ -59,6 +79,26 @@ class ApplyGameProductIdMappingTest(unittest.TestCase):
         self.assertIsNone(game)
         self.assertIsNone(region)
 
+    def test_game_product_id_ignores_rule_raw_region(self):
+        rows = [_rule(raw_region="欧美", match_value="1779344175941", game="勇者联盟", target_region="欧美")]
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping(None, "官网客服", "1779344175941", "", "")
+        self.assertEqual(channel, "官网客服")
+        self.assertEqual(region, "欧美")
+        self.assertEqual(game, "勇者联盟")
+
+    def test_non_product_id_still_requires_raw_region(self):
+        rows = [
+            _rule(raw_region="英语区", raw_channel="DC", match_field="none", game="冒险大作战", match_value=None, target_channel="DC", target_region="欧美"),
+        ]
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("日本", "DC", "冒险大作战", "", "hello")
+        self.assertEqual(channel, "DC")
+        self.assertEqual(region, "日本")
+        self.assertIsNone(game)
+
     def test_does_not_rewrite_dc_game_names(self):
         rows = [
             _rule(raw_channel="DC", match_field="none", game="冒险大作战", match_value=None, target_channel="DC", target_region="欧美"),
@@ -69,6 +109,62 @@ class ApplyGameProductIdMappingTest(unittest.TestCase):
             channel, region, game = _apply_mapping("英语区", "DC", "冒险大作战", "", "hello")
         self.assertEqual(channel, "DC")
         self.assertEqual(region, "欧美")
+        self.assertIsNone(game)
+
+    def _sea_channel_rows(self, include_fb=True, include_any=True):
+        rows = []
+        if include_any:
+            rows.append(_rule(raw_region="东南亚", raw_channel=None, match_field="none", game=None, match_value=None, target_channel="DC", target_region="东南亚"))
+        if include_fb:
+            rows.append(_rule(raw_region="东南亚", raw_channel="FB", match_field="none", game=None, match_value=None, target_channel="FB", target_region="东南亚"))
+        return rows
+
+    def test_fb_sea_prefix_beats_empty_channel_rule(self):
+        rows = self._sea_channel_rows()
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("东南亚", "FB-Sea", "Mushroom Rush", "", "")
+        self.assertEqual((channel, region, game), ("FB", "东南亚", None))
+
+    def test_fb_still_matches_fb_rule(self):
+        rows = self._sea_channel_rows()
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("东南亚", "FB", "Mushroom Rush", "", "")
+        self.assertEqual((channel, region, game), ("FB", "东南亚", None))
+
+    def test_dc_sea_does_not_match_fb_rule(self):
+        rows = self._sea_channel_rows()
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("东南亚", "DC-Sea", "Mushroom Rush", "", "")
+        self.assertEqual((channel, region, game), ("DC", "东南亚", None))
+
+    def test_empty_channel_rule_used_only_without_specific_channel(self):
+        rows = self._sea_channel_rows(include_fb=False, include_any=True)
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("东南亚", "FB-Sea", "Mushroom Rush", "", "")
+        self.assertEqual((channel, region, game), ("DC", "东南亚", None))
+
+    def test_exact_channel_beats_prefix_rule(self):
+        rows = [
+            _rule(raw_region="东南亚", raw_channel="FB", match_field="none", game=None, match_value=None, target_channel="FB", target_region="东南亚"),
+            _rule(raw_region="东南亚", raw_channel="FB-Sea", match_field="none", game=None, match_value=None, target_channel="FB", target_region="东南亚"),
+            _rule(raw_region="东南亚", raw_channel=None, match_field="none", game=None, match_value=None, target_channel="DC", target_region="东南亚"),
+        ]
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("东南亚", "FB-Sea", "Mushroom Rush", "", "")
+        self.assertEqual((channel, region, game), ("FB", "东南亚", None))
+
+    def test_non_product_id_channel_rule_still_requires_raw_region(self):
+        rows = self._sea_channel_rows()
+        with patch("database.SessionLocal") as session_cls:
+            session_cls.return_value.query.return_value.filter.return_value.all.return_value = rows
+            channel, region, game = _apply_mapping("日本", "FB-Sea", "Mushroom Rush", "", "")
+        self.assertEqual(channel, "FB-Sea")
+        self.assertEqual(region, "日本")
         self.assertIsNone(game)
 
 

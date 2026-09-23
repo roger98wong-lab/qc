@@ -197,7 +197,9 @@ body { margin: 0; background: #f4f7fb; }
 .qc-history-table .ant-table-cell { white-space: nowrap; }
 .qc-history-table .ant-table-cell-fix-right { background: #fff; box-shadow: -8px 0 12px -10px rgba(15,23,42,.18); }
 .qc-history-name { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qc-history-counts { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qc-history-table .qc-history-counts-cell { overflow: hidden; vertical-align: top; }
+.qc-history-counts { display: flex; flex-direction: column; gap: 2px; line-height: 1.35; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qc-history-counts span { display: block; white-space: nowrap; }
 .qc-history-ops { display: inline-flex; align-items: center; gap: 4px; flex-wrap: nowrap; white-space: nowrap; min-height: 24px; }
 .qc-history-ops .ant-btn { flex: 0 0 auto; height: 24px; padding: 0 8px; }
 .qc-history-more { width: 24px; min-width: 24px; padding-inline: 0; }
@@ -230,6 +232,11 @@ body { margin: 0; background: #f4f7fb; }
   background: #dc2626; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center;
 }
 .qc-mapping-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; overflow: visible; }
+.qc-mapping-batch-enable, .qc-mapping-status-on, .qc-mapping-enable-ok { color: #fff !important; border-color: #16a34a !important; background: #16a34a !important; }
+.qc-mapping-batch-enable:hover, .qc-mapping-status-on:hover, .qc-mapping-enable-ok:hover { color: #fff !important; border-color: #15803d !important; background: #15803d !important; }
+.qc-mapping-batch-enable:disabled { color: rgba(255,255,255,.65) !important; border-color: #86efac !important; background: #86efac !important; }
+.qc-mapping-status-off { color: #b91c1c; border-color: #fecaca; background: #fff; }
+.qc-mapping-table .ant-table-selection-column, .qc-mapping-table .ant-table-cell-fix-right { white-space: nowrap; }
 .qc-mapping-help { color: #64748b; font-size: 12px; }
 .qc-mapping-filter-collapse { margin-bottom: 14px; overflow: hidden; border-color: #dbe4f0; background: #f8fafc; }
 .qc-mapping-filter-collapse > .ant-collapse-item > .ant-collapse-header { align-items: center; padding: 10px 14px; color: #334155; font-weight: 600; }

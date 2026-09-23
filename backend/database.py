@@ -8,9 +8,11 @@ engine = create_engine(
     # Upload parsing can take minutes for a large multipart request.  Never
     # let that transaction make short auth/read requests fail immediately.
     connect_args={"check_same_thread": False, "timeout": 30},
+    pool_pre_ping=True,
 )
 
 from sqlalchemy import event
+from sqlalchemy.exc import DatabaseError, OperationalError
 
 
 @event.listens_for(engine, "connect")
@@ -19,6 +21,38 @@ def _sqlite_connection_pragmas(dbapi_connection, _connection_record):
     cursor.execute("PRAGMA busy_timeout=30000")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+def sqlite_error_kind(exc: BaseException) -> str | None:
+    """Classify SQLite lock/corruption so API routes can return a stable message."""
+    text = " ".join(str(part) for part in getattr(exc, "args", ()) if part).lower()
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        text = f"{text} {' '.join(str(part) for part in getattr(orig, 'args', ()) if part)}".lower()
+    if "malformed" in text or "corrupt" in text or "disk image is malformed" in text:
+        return "malformed"
+    if "too many sql variables" in text or "too many terms in compound select" in text:
+        return "too_many_vars"
+    if "database is locked" in text or "database is busy" in text:
+        return "locked"
+    if isinstance(exc, OperationalError) and "locked" in text:
+        return "locked"
+    if isinstance(exc, DatabaseError) and "malformed" in text:
+        return "malformed"
+    return None
+
+
+def sqlite_user_message(exc: BaseException, action: str = "操作") -> str:
+    kind = sqlite_error_kind(exc)
+    if kind == "locked":
+        return f"{action}失败：数据库正被其他任务占用，请稍后重试。不要强制杀进程。"
+    if kind == "malformed":
+        return f"{action}失败：数据库文件已损坏，请停止写入并联系管理员恢复备份。"
+    if kind == "too_many_vars":
+        return f"{action}失败：批次数据量过大，请刷新页面后重试（服务端将按批次删除，不再一次绑定全部切片 ID）。"
+    return f"{action}失败：{exc}"
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -38,7 +72,10 @@ class User(Base):
     role       = Column(String(20), default="analyst")   # admin | analyst
     is_active  = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     last_login = Column(DateTime, nullable=True)
+    disable_effective_at = Column(DateTime, nullable=True)
+    must_change_password = Column(Boolean, default=False, nullable=False)
 
 
 # ── 分析批次 ─────────────────────────────────────────────────────────────────
@@ -117,6 +154,26 @@ class MappingConfig(Base):
     enabled = Column(Boolean, default=True)
     remark = Column(String(300), nullable=True)
     created_at = Column(DateTime, default=utcnow)
+
+
+class GameAiConfig(Base):
+    """Per standard-game + standard-region switch for AI/MaaS analysis.
+
+    Kept independent from MappingConfig so region/channel matching rules stay
+    unchanged. Unmatched slices default to analysis off.
+    """
+    __tablename__ = "game_ai_configs"
+    __table_args__ = (
+        UniqueConstraint("game", "region", name="uq_game_ai_configs_game_region"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    game = Column(String(100), nullable=False)
+    region = Column(String(100), nullable=False)
+    analysis_enabled = Column(Boolean, nullable=False, default=False)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
 class SystemDictionary(Base):
@@ -262,6 +319,10 @@ class QcSlice(Base):
     source_format       = Column(String(40), nullable=True)
     source_sheet        = Column(String(80), nullable=True)
     source_problem_id   = Column(String(200), nullable=True)
+    skip_reason         = Column(String(80), nullable=True)
+    ai_config_id        = Column(Integer, nullable=True)
+    ai_config_snapshot_json = Column(Text, nullable=True)
+    analysis_enabled_snapshot = Column(Boolean, nullable=True)
 
     batch = relationship("AnalysisBatch", back_populates="slices")
     quality_issues = relationship("QcSliceQualityIssue", back_populates="slice", cascade="all, delete-orphan")
@@ -553,14 +614,35 @@ class Report(Base):
     batch = relationship("AnalysisBatch", back_populates="reports")
 
 
+def configure_sqlite():
+    """Enable WAL once per process so readers are not blocked by writers."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("PRAGMA synchronous=NORMAL"))
+        conn.execute(text("PRAGMA busy_timeout=30000"))
+
+
 def init_db():
     from sqlalchemy import inspect, text
+    configure_sqlite()
     new_dictionary_table = "system_dictionaries" not in inspect(engine).get_table_names()
     Base.metadata.create_all(bind=engine)
     seed_mapping_configs()
+    seed_game_ai_configs()
     if new_dictionary_table:
         seed_system_dictionaries()
     inspector = inspect(engine)
+    if "users" in inspector.get_table_names():
+        columns = {c["name"] for c in inspector.get_columns("users")}
+        with engine.begin() as conn:
+            for name, definition in {
+                "updated_at": "DATETIME",
+                "disable_effective_at": "DATETIME",
+                "must_change_password": "BOOLEAN DEFAULT 0",
+            }.items():
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
     if "qc_issues" in inspector.get_table_names():
         columns = {c["name"] for c in inspector.get_columns("qc_issues")}
         additions = {"priority": "VARCHAR(10)", "status": "VARCHAR(30)", "assignee": "VARCHAR(100)", "updated_at": "DATETIME"}
@@ -592,7 +674,11 @@ def init_db():
                 if name not in columns: conn.execute(text(f"ALTER TABLE sessions ADD COLUMN {name} {definition}"))
     if "qc_slices" in inspector.get_table_names():
         columns = {c["name"] for c in inspector.get_columns("qc_slices")}
-        additions = {"source_format": "VARCHAR(40)", "source_sheet": "VARCHAR(80)", "source_problem_id": "VARCHAR(200)", "uploaded_file_id": "INTEGER"}
+        additions = {
+            "source_format": "VARCHAR(40)", "source_sheet": "VARCHAR(80)", "source_problem_id": "VARCHAR(200)",
+            "uploaded_file_id": "INTEGER", "skip_reason": "VARCHAR(80)", "ai_config_id": "INTEGER",
+            "ai_config_snapshot_json": "TEXT", "analysis_enabled_snapshot": "BOOLEAN",
+        }
         with engine.begin() as conn:
             for name, definition in additions.items():
                 if name not in columns: conn.execute(text(f"ALTER TABLE qc_slices ADD COLUMN {name} {definition}"))
@@ -712,6 +798,12 @@ def init_db():
             for name, definition in additions.items():
                 if name not in columns:
                     conn.execute(text(f"ALTER TABLE qc_slice_knowledge_suggestions ADD COLUMN {name} {definition}"))
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_qc_slices_batch_id ON qc_slices(batch_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_sessions_batch_id ON sessions(batch_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ai_messages_batch_id ON ai_messages(batch_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_uploaded_files_batch_id ON uploaded_files(batch_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_qc_issues_batch_id ON qc_issues(batch_id)"))
 
 
 def seed_system_dictionaries():
@@ -830,6 +922,12 @@ def seed_mapping_configs():
         add(raw_channel="VIP",target_channel="VIP后台",target_region=None,remark="VIP后台不作为地区")
         db.add_all(rows); db.commit()
     finally: db.close()
+
+
+def seed_game_ai_configs():
+    """Seed AI analysis switches after mapping configs exist."""
+    from services.game_ai_config import seed_game_ai_configs as _seed
+    _seed()
 
 
 def get_db():

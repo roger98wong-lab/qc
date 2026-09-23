@@ -7,7 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 os.chdir(ROOT / "backend")
 
-from services.excel_parser import _filter_standard_messages, _message_speaker, _parse_standard, parse_standard_dialogue
+from services.excel_parser import (
+    _filter_standard_messages, _message_speaker, _parse_standard,
+    extract_human_kb_suggestions, parse_standard_dialogue,
+)
 
 
 def _line(role, body, ts="2026-09-17 12:00:00"):
@@ -79,6 +82,46 @@ class StandardSliceFilterTest(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         speakers = [item["speaker"] for item in sessions[0]["slice_payload"]["messages"]]
         self.assertEqual(speakers, ["player", "human_agent"])
+
+    def test_uce_push_is_system_not_human_agent(self):
+        self.assertEqual(_message_speaker({"role": "客服-uce_push"}), "system")
+        self.assertEqual(_message_speaker({"role": " 客服 - UCE_PUSH "}), "system")
+        self.assertEqual(_message_speaker({"role": "客服－uce_push"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服‐uce_push"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-张三"}), "human_agent")
+        self.assertEqual(_message_speaker({"role": "客服 - 李四"}), "human_agent")
+        self.assertEqual(_message_speaker({"role": "🤵客服-焦思阳"}), "human_agent")
+
+    def test_player_and_uce_push_only_is_dropped(self):
+        dialogue = "\n".join([_line("用户", "你好"), _line("客服-uce_push", "活动推送")])
+        sessions, suggestions, _ = _parse_standard(_frame(dialogue), "DC")
+        self.assertEqual(sessions, [])
+        self.assertEqual(suggestions, [])
+
+    def test_uce_push_variants_are_dropped_but_real_agent_kept(self):
+        dialogue = "\n".join([
+            _line("用户", "怎么玩"),
+            _line("客服 - uce_push", "系统推送"),
+            _line("客服-UCE_PUSH", "另一条推送"),
+            _line("客服-张三", "我来帮你处理"),
+        ])
+        sessions, suggestions, _ = _parse_standard(_frame(dialogue), "VK")
+        self.assertEqual(len(sessions), 1)
+        messages = sessions[0]["slice_payload"]["messages"]
+        self.assertEqual([item["speaker"] for item in messages], ["player", "human_agent"])
+        self.assertEqual(messages[1]["speaker_source"], "客服-张三")
+        self.assertFalse(any("uce_push" in str(item.get("speaker_source") or "").lower() for item in messages))
+        self.assertEqual(suggestions, [])
+
+    def test_filtered_uce_push_does_not_create_kb_suggestion(self):
+        dialogue = "\n".join([
+            _line("用户", "怎么找回账号"),
+            _line("客服-uce_push", "感谢你的咨询，活动详情请查看公告。"),
+            _line("用户", "谢谢"),
+        ])
+        msgs = _filter_standard_messages(parse_standard_dialogue(dialogue))
+        self.assertEqual(msgs, [])
+        self.assertEqual(extract_human_kb_suggestions(msgs, "冒险大作战", "欧美", "DC"), [])
 
 
 class IssuePairDefaultTest(unittest.TestCase):

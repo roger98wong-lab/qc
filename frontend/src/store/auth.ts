@@ -5,6 +5,8 @@ interface UserInfo {
   username: string
   email: string
   role: string
+  must_change_password?: boolean
+  status?: string
 }
 
 interface AuthState {

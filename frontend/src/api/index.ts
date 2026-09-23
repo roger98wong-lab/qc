@@ -37,6 +37,8 @@ export const authApi = {
   listUsers: () => api.get('/auth/users'),
   createUser: (data: object) => api.post('/auth/users', data),
   toggleUser: (id: number) => api.patch(`/auth/users/${id}/toggle`),
+  updateUser: (id: number, data: object) => api.patch(`/auth/users/${id}`, data),
+  deleteUser: (id: number, data?: object) => api.delete(`/auth/users/${id}`, { data }),
   resetPassword: (id: number, new_password: string) =>
     api.post(`/auth/users/${id}/reset-password`, { new_password }),
 }
@@ -69,7 +71,7 @@ export const analysisApi = {
   finalizeUpload: (batchId: number) => api.post(`/analysis/batch/${batchId}/finalize-upload`),
   retryParse: (batchId: number, fileId: number) => api.post(`/analysis/batch/${batchId}/files/${fileId}/retry-parse`),
   listBatches: () => api.get('/analysis/batches'),
-  deleteBatch: (batchId: number) => api.delete(`/analysis/batch/${batchId}`),
+  deleteBatch: (batchId: number) => api.delete(`/analysis/batch/${batchId}`, { timeout: 180000 }),
 }
 
 // ── 报告 ──────────────────────────────────────────────────────────────────────
@@ -107,9 +109,19 @@ export const adminApi = {
   getMappingOptions: () => api.get('/admin/mappings/options'),
   createMapping: (data: object) => api.post('/admin/mappings', data),
   updateMapping: (id: number, data: object) => api.patch(`/admin/mappings/${id}`, data),
+  batchSetMappingEnabled: (ids: number[], enabled: boolean) => api.post('/admin/mappings/batch-enabled', { ids, enabled }),
+  applyGameProductIds: (match_values?: string[]) => api.post('/admin/mappings/apply-game-product-ids', match_values ? { match_values } : {}),
   deleteMapping: (id: number) => api.delete(`/admin/mappings/${id}`),
+  listGameAiConfigs: (params?: object) => api.get('/admin/game-ai-configs', { params }),
+  getGameAiConfigOptions: () => api.get('/admin/game-ai-configs/options'),
+  createGameAiConfig: (data: object) => api.post('/admin/game-ai-configs', data),
+  updateGameAiConfig: (id: number, data: object) => api.put(`/admin/game-ai-configs/${id}`, data),
+  deleteGameAiConfig: (id: number) => api.delete(`/admin/game-ai-configs/${id}`),
   listAuditSlices: (params?: object) => api.get('/admin/audit/slices', { params }),
   getAuditSlice: (id: number | string) => api.get(`/admin/audit/slices/${id}`),
+  listAuditLogs: (params?: object) => api.get('/admin/audit-logs', { params }),
+  getAuditLogOptions: () => api.get('/admin/audit-logs/options'),
+  exportAuditLogs: (params?: object) => api.get('/admin/audit-logs/export', { params, responseType: 'blob' }),
   listDictionaries: (group?: string) => api.get('/admin/dictionaries', { params: group ? { group } : undefined }),
   createDictionary: (data: object) => api.post('/admin/dictionaries', data),
   updateDictionary: (id: number, data: object) => api.patch(`/admin/dictionaries/${id}`, data),

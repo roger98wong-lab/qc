@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, FileResponse, Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 from typing import Optional
 
@@ -158,49 +159,83 @@ def list_issues(
     return paged
 
 
+def _legacy_issue_base(db, batch_id: Optional[int]):
+    query = db.query(QcIssue)
+    if batch_id:
+        query = query.filter(QcIssue.batch_id == batch_id)
+    return query
+
+
+def _primary_slice_issue_base(db, batch_id: Optional[int]):
+    query = db.query(QcSliceQualityIssue).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+        QcSliceQualityIssue.is_primary.is_(True),
+    )
+    if batch_id:
+        query = query.filter(QcSlice.batch_id == batch_id)
+    return query
+
+
+def _add_counts(counter, rows):
+    for value, count in rows:
+        if value not in (None, ""):
+            counter[value] += int(count or 0)
+
+
+def _distinct_values(query, column):
+    return {value for value, in query.with_entities(column).filter(column.isnot(None), column != "").distinct().all() if value}
+
+
 @router.get("/stats", summary="统计概览")
 def get_stats(
     batch_id: Optional[int] = Query(None),
     db: DbSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = db.query(QcIssue)
-    if batch_id:
-        q = q.filter(QcIssue.batch_id == batch_id)
-    all_issues = q.all()
-    if current_user.role not in {"admin", "analyst"}:
-        all_issues = [row for row in all_issues if _legacy_owned(row, current_user)]
-    nq = db.query(QcSliceQualityIssue, QcSlice).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id)
-    if batch_id: nq = nq.filter(QcSlice.batch_id == batch_id)
-    slice_issues = nq.all()
-    if current_user.role not in {"admin", "analyst"}:
-        assignments = _latest_assignments(db)
-        slice_issues = [(issue, row) for issue, row in slice_issues if _can_view_new(db, "quality_issue", issue.id, current_user, assignments)]
-
     from collections import Counter
-    severity_counts = Counter(i.severity for i in all_issues)
-    type_counts     = Counter(i.issue_type for i in all_issues)
-    sessions        = set(i.session_uid for i in all_issues)
-    channels        = set(i.channel for i in all_issues if i.channel)
-    games           = set(i.game    for i in all_issues if i.game)
-    for issue, slice_row in slice_issues:
-        if issue.is_primary:
-            severity_counts[issue.severity] += 1
-            type_counts[issue.issue_type] += 1
-            sessions.add(slice_row.slice_id)
-            if slice_row.channel: channels.add(slice_row.channel)
-            if slice_row.game: games.add(slice_row.game)
+    if current_user.role not in {"admin", "analyst"}:
+        raise HTTPException(403, "需要质检员或管理员权限")
 
-    # 获取批次信息
+    legacy = _legacy_issue_base(db, batch_id)
+    slice_q = _primary_slice_issue_base(db, batch_id)
+    severity_counts = Counter()
+    type_counts = Counter()
+    _add_counts(severity_counts, legacy.with_entities(QcIssue.severity, func.count(QcIssue.id)).group_by(QcIssue.severity).all())
+    _add_counts(severity_counts, slice_q.with_entities(QcSliceQualityIssue.severity, func.count(QcSliceQualityIssue.id)).group_by(QcSliceQualityIssue.severity).all())
+    _add_counts(type_counts, legacy.with_entities(QcIssue.issue_type, func.count(QcIssue.id)).group_by(QcIssue.issue_type).all())
+    _add_counts(type_counts, slice_q.with_entities(QcSliceQualityIssue.issue_type, func.count(QcSliceQualityIssue.id)).group_by(QcSliceQualityIssue.issue_type).all())
+
+    legacy_total = int(legacy.with_entities(func.count(QcIssue.id)).scalar() or 0)
+    slice_total = int(slice_q.with_entities(func.count(QcSliceQualityIssue.id)).scalar() or 0)
+    sessions = _distinct_values(legacy, QcIssue.session_uid) | _distinct_values(
+        db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+            QcSliceQualityIssue.is_primary.is_(True),
+            *((QcSlice.batch_id == batch_id,) if batch_id else ()),
+        ),
+        QcSlice.slice_id,
+    )
+    channels = _distinct_values(legacy, QcIssue.channel) | _distinct_values(
+        db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+            QcSliceQualityIssue.is_primary.is_(True),
+            *((QcSlice.batch_id == batch_id,) if batch_id else ()),
+        ),
+        QcSlice.channel,
+    )
+    games = _distinct_values(legacy, QcIssue.game) | _distinct_values(
+        db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
+            QcSliceQualityIssue.is_primary.is_(True),
+            *((QcSlice.batch_id == batch_id,) if batch_id else ()),
+        ),
+        QcSlice.game,
+    )
+
     total_ai_msgs = 0
     if batch_id:
-        b = db.query(AnalysisBatch).filter(AnalysisBatch.id == batch_id).first()
+        b = db.query(AnalysisBatch.total_slices, AnalysisBatch.total_ai_msgs).filter(AnalysisBatch.id == batch_id).first()
         if b:
             total_ai_msgs = b.total_slices or b.total_ai_msgs or 0
 
-    primary_slice_issues = [issue for issue, _slice in slice_issues if issue.is_primary]
     return {
-        "total_issues": len(all_issues) + len(primary_slice_issues),
+        "total_issues": legacy_total + slice_total,
         "total_ai_msgs": total_ai_msgs,
         "affected_sessions": len(sessions),
         "severe": severity_counts.get("严重", 0),
@@ -220,26 +255,26 @@ def filter_options(
     db: DbSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = db.query(QcIssue)
+    if current_user.role not in {"admin", "analyst"}:
+        raise HTTPException(403, "需要质检员或管理员权限")
+    legacy = _legacy_issue_base(db, batch_id)
+    slice_rows = db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id)
     if batch_id:
-        q = q.filter(QcIssue.batch_id == batch_id)
-    issues = q.all()
-    if current_user.role not in {"admin", "analyst"}:
-        issues = [row for row in issues if _legacy_owned(row, current_user)]
-    nq = db.query(QcSliceQualityIssue, QcSlice).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id)
-    if batch_id: nq = nq.filter(QcSlice.batch_id == batch_id)
-    slice_issues = nq.all()
-    if current_user.role not in {"admin", "analyst"}:
-        assignments = _latest_assignments(db)
-        slice_issues = [(issue, row) for issue, row in slice_issues if _can_view_new(db, "quality_issue", issue.id, current_user, assignments)]
-
-    from collections import Counter
+        slice_rows = slice_rows.filter(QcSlice.batch_id == batch_id)
+    slice_issues = db.query(QcSliceQualityIssue).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id)
+    if batch_id:
+        slice_issues = slice_issues.filter(QcSlice.batch_id == batch_id)
+    severities = _distinct_values(legacy, QcIssue.severity) | _distinct_values(slice_issues, QcSliceQualityIssue.severity)
+    issue_types = _distinct_values(legacy, QcIssue.issue_type) | _distinct_values(slice_issues, QcSliceQualityIssue.issue_type)
+    channels = _distinct_values(legacy, QcIssue.channel) | _distinct_values(slice_rows, QcSlice.channel)
+    games = _distinct_values(legacy, QcIssue.game) | _distinct_values(slice_rows, QcSlice.game)
+    regions = _distinct_values(legacy, QcIssue.region) | _distinct_values(slice_rows, QcSlice.region)
     return {
-        "severities":   sorted(set([i.severity for i in issues if i.severity] + [i.severity for i,s in slice_issues]), key=lambda s: SEVERITY_ORDER.get(s, 9)),
-        "issue_types":  sorted(set([i.issue_type for i in issues if i.issue_type] + [i.issue_type for i,s in slice_issues])),
-        "channels":     sorted(set([i.channel for i in issues if i.channel] + [s.channel for i,s in slice_issues if s.channel])),
-        "games":        sorted(set([i.game for i in issues if i.game] + [s.game for i,s in slice_issues if s.game])),
-        "regions":      sorted(set([i.region for i in issues if i.region] + [s.region for i,s in slice_issues if s.region])),
+        "severities": sorted(severities, key=lambda value: SEVERITY_ORDER.get(value, 9)),
+        "issue_types": sorted(issue_types),
+        "channels": sorted(channels),
+        "games": sorted(games),
+        "regions": sorted(regions),
     }
 
 

@@ -52,8 +52,9 @@ export default function History() {
     setRowAction({ id: row.id, action })
     try {
       if (action === 'delete') {
+        message.loading({ content: '正在删除批次数据，切片较多时可能需要一两分钟…', key: 'batch-delete', duration: 0 })
         await analysisApi.deleteBatch(row.id)
-        message.success('删除成功')
+        message.success({ content: '删除成功', key: 'batch-delete' })
         setBatches(current => current.filter(item => item.id !== row.id))
         return
       }
@@ -67,6 +68,7 @@ export default function History() {
       const response = await api(row.id)
       mergeRow(row.id, response.data)
     } catch (error) {
+      if (action === 'delete') message.destroy('batch-delete')
       message.error(errorText(error, '操作失败'))
       await load(true)
     } finally {
@@ -97,11 +99,18 @@ export default function History() {
       render: (value: string) => <Tag color={BATCH_STATUS_COLOR[value] || 'default'}>{BATCH_STATUS_LABEL[value] || value}</Tag>,
     },
     {
-      title: '已处理 / 待处理', width: 168,
+      title: '已处理 / 待处理', width: 176, ellipsis: false,
+      onHeaderCell: () => ({ style: { minWidth: 176 } }),
+      onCell: () => ({ className: 'qc-history-counts-cell', style: { minWidth: 176 } }),
       render: (_: any, row: any) => {
         const processed = Number(row.processed_count ?? row.analyzed_slices ?? 0)
         const pending = Number(row.pending_count ?? 0)
-        return <span className="qc-history-counts">已处理 {processed} · 待处理 {pending}</span>
+        return (
+          <span className="qc-history-counts">
+            <span>已处理 {processed}</span>
+            <span>待处理 {pending}</span>
+          </span>
+        )
       },
     },
     { title: '问题数', dataIndex: 'issue_count', width: 72 },
@@ -194,7 +203,7 @@ export default function History() {
           className="qc-history-table"
           rowKey="id" dataSource={batches} columns={columns}
           loading={loading} pagination={{ pageSize: 20 }}
-          size="small" scroll={{ x: 860 }}
+          size="small" scroll={{ x: 980 }}
           expandable={{
             expandedRowRender: row => row.error_msg
               ? <div className="qc-history-error">{row.error_msg}</div>

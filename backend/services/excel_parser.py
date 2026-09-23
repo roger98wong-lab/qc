@@ -174,6 +174,7 @@ def _parse_mbackend(df: pd.DataFrame, sheet_name: str) -> tuple[list[dict], list
         # Mapping decisions are configuration-only. No language/game/file-name
         # inference is performed for the M-backend source.
         region = _map_mbackend_region(raw_region, game)
+        game, region = _force_mushroom_rush_to_sea_adventure(game, region)
         if not region:
             row_warnings.append(f"第 {row_number} 行地区“{raw_region or '空'}”未映射，标准地区为空")
         slice_id = f"mbackend:{{batch_id}}:{problem_id}"
@@ -211,10 +212,41 @@ CHANNEL_SIGNATURES = {
 }
 
 REGION_BY_AGENT = {
-    "黄英杰": "欧美地区", "徐碧芸": "欧美地区",
-    "梁楚恩": "欧美地区", "焦思阳": "欧美地区",
-    "谭彩雯": "东南亚地区", "胡家圣": "东南亚地区", "杜永昌": "东南亚地区",
+    "黄英杰": "欧美", "徐碧芸": "欧美",
+    "梁楚恩": "欧美", "焦思阳": "欧美",
+    "谭彩雯": "东南亚", "胡家圣": "东南亚", "杜永昌": "东南亚",
 }
+
+
+def _vip_agent_token(raw: str) -> str:
+    value = str(raw or "").strip()
+    while True:
+        nxt = re.sub(r"^[^\w]+", "", value, count=1).strip()
+        nxt = re.sub(r"^(?:客服|人工客服|human_agent|operator|agent)[\s\-－‐‑‒–—―:：/、]+", "", nxt, count=1, flags=re.I).strip()
+        if nxt == value:
+            break
+        value = nxt
+    return value
+
+
+def resolve_vip_region(kefu_raw: str, messages=None) -> str | None:
+    """Map VIP agent names to standard regions; never keep VIP后台 as a region."""
+    candidates = []
+    for agent in str(kefu_raw or "").replace("，", ",").replace("、", ",").split(","):
+        token = _vip_agent_token(agent)
+        if token:
+            candidates.append(token)
+    for message in messages or []:
+        token = _vip_agent_token(message.get("role") or message.get("speaker_source") or "")
+        if token:
+            candidates.append(token)
+    for token in candidates:
+        if token in REGION_BY_AGENT:
+            return REGION_BY_AGENT[token]
+        for name, region in REGION_BY_AGENT.items():
+            if name and name in token:
+                return region
+    return None
 
 VIP_AI_MARKERS = [
     "This reply was provided by the AI",
@@ -277,6 +309,8 @@ def extract_human_kb_suggestions(
     suggestions = []
     for idx, msg in enumerate(messages):
         if msg.get("is_user") or msg.get("is_ai") or msg.get("is_auto"):
+            continue
+        if _message_speaker(msg) != "human_agent":
             continue
         # 这是一条人工客服回复
         agent_reply = msg["content"].strip()
@@ -540,6 +574,7 @@ def _parse_overseas(df: pd.DataFrame, shared_seen: set[str] | None = None) -> tu
         mapped_channel, region, mapped_game = _apply_mapping(None, "官网客服", game, "", "")
         if mapped_game:
             game = mapped_game
+        game, region = _force_mushroom_rush_to_sea_adventure(game, region)
         valid_messages_for_session = [message for message in messages if message.get("text")]
         if not valid_messages_for_session:
             continue
@@ -714,6 +749,48 @@ def extract_context(messages: list[dict], ai_idx: int, n_before: int = 2) -> str
     return "\n".join(ctx)
 
 
+_UCE_PUSH_ROLE_RE = re.compile(
+    r"客服[\s\-–—－‐‑−~～]*uce[\s_\-–—－‐‑−]*push",
+    re.IGNORECASE,
+)
+
+
+def _is_uce_push_role(role: str) -> bool:
+    """True for the standard-channel system push identity, not a named agent."""
+    text = str(role or "").strip()
+    if not text:
+        return False
+    return bool(_UCE_PUSH_ROLE_RE.search(text))
+
+
+_AGENT_ROLE_PREFIX = re.compile(
+    r"^(?:客服|人工客服|human_agent|operator|agent)[\s\-–—－:：/、]+",
+    re.IGNORECASE,
+)
+
+
+def _role_person_token(role: str) -> str:
+    value = str(role or "").strip()
+    while True:
+        nxt = _AGENT_ROLE_PREFIX.sub("", value, count=1).strip()
+        if nxt == value:
+            break
+        value = nxt
+    return value
+
+
+def _looks_like_person_role(role: str) -> bool:
+    """Excel sometimes puts an AI instruction into the 客服- role field."""
+    token = _role_person_token(role)
+    if not token or len(token) > 24:
+        return False
+    if any(mark in token for mark in ".?!。！？\n\r{}[]\""):
+        return False
+    if len(token.split()) > 3:
+        return False
+    return True
+
+
 def _message_speaker(message: dict) -> str:
     """Map parser facts to the compact slice protocol; never infer from text."""
     if message.get("is_user"):
@@ -722,11 +799,18 @@ def _message_speaker(message: dict) -> str:
         return "ai"
     if message.get("is_auto"):
         return "system"
+    # System campaign pushes reuse the 客服- prefix. Classify them before the
+    # generic agent markers so they never become human_agent.
+    if _is_uce_push_role(message.get("role") or ""):
+        return "system"
     # A residual role is human only when the source explicitly identifies a
     #客服/agent.  Other unrecognised source values remain ``unknown`` instead
     # of being silently promoted to a human or AI speaker.
-    role = str(message.get("role") or "").lower()
+    raw_role = str(message.get("role") or "")
+    role = raw_role.lower()
     if any(marker in role for marker in ("客服", "agent", "人工", "operator", "gm")):
+        if not _looks_like_person_role(raw_role):
+            return "ai"
         return "human_agent"
     return "unknown"
 
@@ -826,6 +910,31 @@ def _mapping_language(text: str) -> str:
     if re.search(r"\b(the|you|your|please|game|account|help|cannot|can't)\b", t.lower()): return "英语"
     return "英语"
 
+def _force_mushroom_rush_to_sea_adventure(game, region=None):
+    """Mushroom Rush 强制写成东南亚冒险。
+
+    英文导出名 Mushroom Rush 对应标准游戏「冒险大作战」、标准地区「东南亚」。
+    写死在解析层，不依赖 MappingConfig，才能命中 game_ai_configs。
+    """
+    if str(game or "").strip().casefold() == "mushroom rush":
+        return "冒险大作战", "东南亚"
+    return game, region
+
+
+def _channel_match_rank(rule_channel, raw_channel):
+    """Prefer exact channel, then prefix, then empty/any-channel rules."""
+    rule = str(rule_channel or "").strip()
+    incoming = str(raw_channel or "")
+    prefix = incoming.split("-", 1)[0]
+    if not rule:
+        return 2
+    if rule == incoming:
+        return 0
+    if rule == prefix:
+        return 1
+    return None
+
+
 def _apply_mapping(raw_region, raw_channel, game, link, dialogue):
     try:
         from database import SessionLocal, MappingConfig
@@ -838,23 +947,28 @@ def _apply_mapping(raw_region, raw_channel, game, link, dialogue):
         for x in rows:
             if (x.match_field or "none") != "gameProductId":
                 continue
-            if x.raw_region and x.raw_region != raw_region: continue
             if x.raw_channel and x.raw_channel not in (raw_channel, str(raw_channel).split('-')[0]): continue
             if str(x.match_value or "").strip() != incoming_game: continue
             return x.target_channel or norm_channel, x.target_region, x.game
-        for x in rows:
+        ranked = []
+        for index, x in enumerate(rows):
             match_field = x.match_field or "none"
             if match_field == "gameProductId":
                 continue
             if x.raw_region and x.raw_region != raw_region: continue
-            if x.raw_channel and x.raw_channel not in (raw_channel, str(raw_channel).split('-')[0]): continue
+            rank = _channel_match_rank(x.raw_channel, raw_channel)
+            if rank is None:
+                continue
             if x.game and x.game != game: continue
             if match_field == "page_id" and x.match_value != page_id: continue
             if match_field == "language" and x.match_value != language: continue
+            ranked.append((rank, index, x))
+        if ranked:
+            x = min(ranked, key=lambda item: (item[0], item[1]))[2]
             return x.target_channel or norm_channel, x.target_region, None
     except Exception:
         pass
-    return norm_channel, raw_region, None
+    return raw_channel, raw_region, None
 
 
 # ── 主解析入口 ────────────────────────────────────────────────────────────────
@@ -954,15 +1068,10 @@ def _parse_vip(df: pd.DataFrame) -> tuple[list[dict], list[dict], str | None]:
         kefu_raw   = str(row.get("客服", ""))
         content    = str(row.get("消息内容", ""))
 
-        # 地区映射
-        region = "VIP后台"
-        for agent in kefu_raw.replace("，", ",").replace("、", ",").split(","):
-            agent = agent.strip()
-            if agent in REGION_BY_AGENT:
-                region = REGION_BY_AGENT[agent]
-                break
-
         msgs = parse_vip_messages(content)
+        region = resolve_vip_region(kefu_raw, msgs)
+        game, region = _force_mushroom_rush_to_sea_adventure(game, region)
+
         slice_id = f"{game}|{role_id}"
         slice_payload = json.loads(_compact_slice(msgs, 0, slice_id=slice_id, channel="VIP", game=game, region=region))
         ai_msgs = []
@@ -1026,10 +1135,13 @@ def _parse_standard(df: pd.DataFrame, channel: str) -> tuple[list[dict], list[di
         uname    = get_col(row, "用户名（三方渠道的）", "用户名")
         dialogue = get_col(row, "对话记录", "内容", "消息内容")
         raw_channel = get_col(row, "客诉渠道", "咨询渠道") or channel
-        mapped_channel, mapped_region, _mapped_game = _apply_mapping(region, raw_channel, game, link, dialogue)
+        mapped_channel, mapped_region, mapped_game = _apply_mapping(region, raw_channel, game, link, dialogue)
         row_channel = mapped_channel or channel
         if mapped_region is not None:
             region = mapped_region
+        if mapped_game:
+            game = mapped_game
+        game, region = _force_mushroom_rush_to_sea_adventure(game, region)
 
         msgs = _filter_standard_messages(parse_standard_dialogue(dialogue, reply_person))
         if not msgs:

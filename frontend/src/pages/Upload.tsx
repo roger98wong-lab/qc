@@ -72,6 +72,20 @@ const mapCounts = (data: any) => ({
   runnable: Number(data?.runnable_count ?? data?.pending_count ?? 0),
 })
 
+const sameCounts = (
+  current: { processed: number; pending: number; runnable: number },
+  next: { processed: number; pending: number; runnable: number },
+) => current.processed === next.processed && current.pending === next.pending && current.runnable === next.runnable
+
+const sameUploadItem = (current: UploadItem | undefined, next: UploadItem) => {
+  if (!current) return false
+  return current.filename === next.filename
+    && current.size === next.size
+    && current.status === next.status
+    && current.error === next.error
+    && current.serverFileId === next.serverFileId
+}
+
 export default function Upload() {
   const navigate = useNavigate()
   const [batchName, setBatchName] = useState('')
@@ -88,6 +102,9 @@ export default function Upload() {
   const [draftLoading, setDraftLoading] = useState(false)
   const eventSourceRef = useRef<EventSource | null>(null)
   const submitLockRef = useRef(false)
+  const mappingGapsRef = useRef<any[]>([])
+  const gapBatchIdRef = useRef<number | null>(null)
+  const gapFetchedRef = useRef(false)
 
   const control = useMemo(
     () => getBatchControlState({
@@ -106,10 +123,11 @@ export default function Upload() {
   const mergeServerFiles = useCallback((files: ServerUploadFile[]) => {
     setItems(current => {
       const byClient = new Map(current.map(item => [item.clientId, item]))
+      let changed = false
       for (const server of files) {
         const clientId = server.client_file_id || `server-${server.file_upload_id}`
         const previous = byClient.get(clientId)
-        byClient.set(clientId, {
+        const next: UploadItem = {
           ...previous,
           clientId,
           filename: server.filename,
@@ -117,18 +135,23 @@ export default function Upload() {
           status: server.status || 'parsed',
           error: server.error || server.upload_error || server.parse_error || undefined,
           serverFileId: server.file_upload_id,
-        })
+        }
+        if (sameUploadItem(previous, next)) continue
+        changed = true
+        byClient.set(clientId, next)
       }
+      if (!changed) return current
       return Array.from(byClient.values())
     })
   }, [])
 
   const applyServerBatch = useCallback((data: any) => {
     if (!data) return
-    if (data.batch_id) setBatchId(data.batch_id)
-    if (data.name) setBatchName(data.name)
-    if (data.status) setBatchStatus(data.status)
-    setCounts(mapCounts(data))
+    if (data.batch_id) setBatchId(current => current === data.batch_id ? current : data.batch_id)
+    if (data.name) setBatchName(current => current === data.name ? current : data.name)
+    if (data.status) setBatchStatus(current => current === data.status ? current : data.status)
+    const nextCounts = mapCounts(data)
+    setCounts(current => sameCounts(current, nextCounts) ? current : nextCounts)
     if (Array.isArray(data.files)) mergeServerFiles(data.files)
   }, [mergeServerFiles])
 
@@ -179,20 +202,36 @@ export default function Upload() {
     return () => window.clearInterval(timer)
   }, [batchId, batchStatus, items, refreshUploadStatus])
 
+  mappingGapsRef.current = mappingGaps
+
   useEffect(() => {
     if (!batchId) {
+      gapBatchIdRef.current = null
+      gapFetchedRef.current = false
       setMappingGaps([])
+      setGapLoading(false)
       return
     }
     let active = true
-    setGapLoading(true)
+    const batchChanged = gapBatchIdRef.current !== batchId
+    if (batchChanged) {
+      gapBatchIdRef.current = batchId
+      gapFetchedRef.current = false
+      setMappingGaps([])
+      setGapLoading(true)
+    } else if (!gapFetchedRef.current) {
+      setGapLoading(true)
+    }
     adminApi.listMappingGaps(batchId).then(response => {
-      if (active) setMappingGaps(response.data?.items || [])
+      if (!active) return
+      gapFetchedRef.current = true
+      setMappingGaps(response.data?.items || [])
     }).catch(() => {
-      if (active) setMappingGaps([])
+      if (!active) return
+      gapFetchedRef.current = true
     }).finally(() => { if (active) setGapLoading(false) })
     return () => { active = false }
-  }, [batchId, items, counts.pending, counts.processed])
+  }, [batchId, counts.pending, counts.processed])
 
   const createDraftsAndOpen = async () => {
     if (!batchId || draftLoading) return

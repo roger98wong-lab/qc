@@ -46,14 +46,30 @@ function resolveConversationRole(message: any): ConversationRole {
   }
   return mapConversationRole(message?.speaker_source ?? message?.speaker)
 }
+function looksLikeAgentPersonName(text: string): boolean {
+  const value = text.trim()
+  if (!value || value.length > 24) return false
+  if (/[.?!。！？\n\r{}\[\]"]/.test(value)) return false
+  if (value.split(/\s+/).filter(Boolean).length > 3) return false
+  return true
+}
 function agentNameFromSource(source?: string | null): string | null {
   const value = (source || '').trim()
   const match = value.match(/^(?:客服|人工客服|human_agent|agent|operator)\s*[-—–:：/]\s*(.+)$/i)
-  return match?.[1]?.trim() || null
+  const name = match?.[1]?.trim() || null
+  return name && looksLikeAgentPersonName(name) ? name : null
 }
 function resolvedAgentName(message: any, role: ConversationRole, record: any): string | null {
   if (role !== 'human_agent') return null
-  return message?.agent_name?.trim() || message?.human_agent_name?.trim() || agentNameFromSource(message?.speaker_source) || record?.agent_name || record?.human_agent_name || null
+  const candidates = [
+    message?.agent_name, message?.human_agent_name, agentNameFromSource(message?.speaker_source),
+    record?.agent_name, record?.human_agent_name,
+  ]
+  for (const candidate of candidates) {
+    const text = String(candidate || '').trim()
+    if (text && looksLikeAgentPersonName(text)) return text
+  }
+  return null
 }
 function transferFormFields(raw: any) {
   return {

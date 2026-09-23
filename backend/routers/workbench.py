@@ -190,6 +190,17 @@ _AGENT_NAME_ROLE_PREFIX = re.compile(
 _AGENT_NAME_DECORATION_PREFIX = re.compile(r"^[^\w]+", re.UNICODE)
 
 
+def _looks_like_agent_person_name(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or len(text) > 24:
+        return False
+    if any(mark in text for mark in ".?!。！？\n\r{}[]\""):
+        return False
+    if len(text.split()) > 3:
+        return False
+    return True
+
+
 def _clean_human_agent_name(raw):
     """Keep the real person name; strip role prefixes and role-only labels."""
     value = str(raw or "").strip()
@@ -205,6 +216,8 @@ def _clean_human_agent_name(raw):
             break
         value = stripped
     if not value or value.lower() in _AGENT_NAME_DISCARDED_NORMALIZED:
+        return None
+    if not _looks_like_agent_person_name(value):
         return None
     return value
 

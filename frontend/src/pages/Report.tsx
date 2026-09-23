@@ -176,6 +176,14 @@ const AGENT_NAME_DISCARDED = /^(system|auto_reply|ai|unknown|系统|用户|玩�
 const AGENT_NAME_PREFIX = /^(?:人工客服|human_agent|operator|agent|客服)(?:[\s\-－‐‑‒–—―:：/、]+)/i
 const AGENT_NAME_DECORATION = /^[^\p{L}\p{N}]+/u
 
+function looksLikeAgentPersonName(text: string): boolean {
+  const value = text.trim()
+  if (!value || value.length > 24) return false
+  if (/[.?!。！？\n\r{}\[\]"]/.test(value)) return false
+  if (value.split(/\s+/).filter(Boolean).length > 3) return false
+  return true
+}
+
 function cleanDisplayedAgentName(value: unknown): string | null {
   let text = String(value || '').trim()
   if (!text) return null
@@ -184,7 +192,7 @@ function cleanDisplayedAgentName(value: unknown): string | null {
     if (stripped === text) break
     text = stripped
   }
-  if (!text || AGENT_NAME_DISCARDED.test(text)) return null
+  if (!text || AGENT_NAME_DISCARDED.test(text) || !looksLikeAgentPersonName(text)) return null
   return text
 }
 

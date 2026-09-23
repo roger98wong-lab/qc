@@ -6,16 +6,19 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
+from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 from auth import get_current_user, require_admin
 import config as config_mod
 from config import ALGORITHM, ANALYSIS_CONCURRENCY, MAAS_TIMEOUT_SECONDS, MAX_UPLOAD_MB, SECRET_KEY, UPLOAD_DIR
 from database import (AiMessage, AnalysisBatch, KbSuggestion, QcIssue, QcSlice,
                       QcSliceKnowledgeSuggestion, QcSliceQualityIssue, Session,
-                      Report, SessionLocal, UploadedFile, User, ReviewAssignment, get_db, utcnow)
+                      Report, SessionLocal, UploadedFile, User, ReviewAssignment, get_db, utcnow,
+                      sqlite_error_kind, sqlite_user_message)
 from services.analyzer import analyze_slice
 from services.excel_parser import detect_channel_from_df, parse_excel_to_sessions
+from services.game_ai_config import should_analyze_from_snapshot, slice_creation_fields
 from audit import record_audit
 
 router = APIRouter(prefix="/api/analysis", tags=["分析"])
@@ -29,7 +32,7 @@ PARSE_SEMAPHORE = threading.Semaphore(PARSE_CONCURRENCY)
 TERMINAL_BATCH_STATUSES = ("completed", "partial", "failed", "done")
 UPLOADABLE_BATCH_STATUSES = ("uploading", "paused", "pending", "parsing")
 STARTABLE_BATCH_STATUSES = ("uploading", "pending", "parsing")
-PROCESSED_SLICE_STATUSES = ("completed", "partial", "failed")
+PROCESSED_SLICE_STATUSES = ("completed", "partial", "failed", "skipped")
 PENDING_SLICE_STATUSES = ("pending", "processing")
 ABORT_REASON = "abort"
 
@@ -41,7 +44,7 @@ def _terminal_batch_status(db, batch: AnalysisBatch) -> tuple[str, int, int]:
     ).count()
     successful = db.query(QcSlice).filter(
         QcSlice.batch_id == batch.id,
-        QcSlice.analysis_status.in_(["completed", "partial"]),
+        QcSlice.analysis_status.in_(["completed", "partial", "skipped"]),
     ).count()
     partial = db.query(QcSlice).filter(
         QcSlice.batch_id == batch.id, QcSlice.analysis_status == "partial"
@@ -56,28 +59,62 @@ def _terminal_batch_status(db, batch: AnalysisBatch) -> tuple[str, int, int]:
     return status, terminal, failed
 
 
-def _slice_counts(db, batch_id: int) -> dict[str, int]:
-    processed = db.query(QcSlice).filter(
-        QcSlice.batch_id == batch_id,
-        QcSlice.analysis_status.in_(PROCESSED_SLICE_STATUSES),
-    ).count()
-    pending = db.query(QcSlice).filter(
-        QcSlice.batch_id == batch_id,
-        QcSlice.analysis_status.in_(PENDING_SLICE_STATUSES),
-    ).count()
-    failed = db.query(QcSlice).filter(
-        QcSlice.batch_id == batch_id, QcSlice.analysis_status == "failed"
-    ).count()
-    runnable = db.query(QcSlice).filter(
-        QcSlice.batch_id == batch_id,
-        QcSlice.analysis_status.in_(["pending", "failed"]),
-    ).count()
+def _empty_slice_counts() -> dict[str, int]:
+    return {"processed_count": 0, "pending_count": 0, "failed_count": 0, "runnable_count": 0}
+
+
+def _slice_counts_from_status_map(status_counts: dict[str, int]) -> dict[str, int]:
+    processed = sum(int(status_counts.get(status) or 0) for status in PROCESSED_SLICE_STATUSES)
+    pending = sum(int(status_counts.get(status) or 0) for status in PENDING_SLICE_STATUSES)
+    failed = int(status_counts.get("failed") or 0)
+    runnable = int(status_counts.get("pending") or 0) + failed
     return {
         "processed_count": processed,
         "pending_count": pending,
         "failed_count": failed,
         "runnable_count": runnable,
     }
+
+
+def _slice_counts(db, batch_id: int) -> dict[str, int]:
+    rows = db.query(QcSlice.analysis_status, func.count(QcSlice.id)).filter(
+        QcSlice.batch_id == batch_id,
+    ).group_by(QcSlice.analysis_status).all()
+    return _slice_counts_from_status_map({status: count for status, count in rows})
+
+
+def _slice_counts_by_batch(db, batch_ids: list[int]) -> dict[int, dict[str, int]]:
+    result = {batch_id: _empty_slice_counts() for batch_id in batch_ids}
+    if not batch_ids:
+        return result
+    rows = db.query(
+        QcSlice.batch_id, QcSlice.analysis_status, func.count(QcSlice.id)
+    ).filter(QcSlice.batch_id.in_(batch_ids)).group_by(
+        QcSlice.batch_id, QcSlice.analysis_status
+    ).all()
+    grouped: dict[int, dict[str, int]] = {}
+    for batch_id, status, count in rows:
+        grouped.setdefault(batch_id, {})[status] = count
+    for batch_id, status_counts in grouped.items():
+        result[batch_id] = _slice_counts_from_status_map(status_counts)
+    return result
+
+
+def _issue_counts_by_batch(db, batch_ids: list[int]) -> dict[int, int]:
+    counts = {batch_id: 0 for batch_id in batch_ids}
+    if not batch_ids:
+        return counts
+    legacy = db.query(QcIssue.batch_id, func.count(QcIssue.id)).filter(
+        QcIssue.batch_id.in_(batch_ids)
+    ).group_by(QcIssue.batch_id).all()
+    for batch_id, count in legacy:
+        counts[batch_id] = int(count or 0)
+    slice_issues = db.query(QcSlice.batch_id, func.count(QcSliceQualityIssue.id)).join(
+        QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id
+    ).filter(QcSlice.batch_id.in_(batch_ids)).group_by(QcSlice.batch_id).all()
+    for batch_id, count in slice_issues:
+        counts[batch_id] = counts.get(batch_id, 0) + int(count or 0)
+    return counts
 
 
 def _progress_payload(batch: AnalysisBatch, counts: dict[str, int] | None = None, error: str | None = None) -> dict:
@@ -163,20 +200,24 @@ def _mark_interrupted_batch(db, batch: AnalysisBatch, message: str = INTERRUPTED
     return changed
 
 
-def reconcile_stale_batches(db: DbSession | None = None) -> int:
+def reconcile_stale_batches(db: DbSession | None = None, batch_id: int | None = None) -> int:
     """Reconcile batches left in-flight by a previous backend process.
 
     Timed-out processing slices are failed. A stuck analyzing row with a dead
     worker is paused (never auto-completed) so start/resume can continue later.
+    Pass ``batch_id`` from operator actions; listing and progress stay read-only.
     """
     local = db or SessionLocal()
     owned = db is None
     changed = 0
     try:
         now = utcnow()
-        batches = local.query(AnalysisBatch).filter(
+        query = local.query(AnalysisBatch).filter(
             AnalysisBatch.status.in_(["analyzing", "paused", "uploading", "pending", "parsing"])
-        ).all()
+        )
+        if batch_id is not None:
+            query = query.filter(AnalysisBatch.id == batch_id)
+        batches = query.all()
         timeout = max(int(config_mod.MAAS_TIMEOUT_SECONDS), 1) + STALE_ANALYSIS_GRACE_SECONDS
         for batch in batches:
             if batch.id in ACTIVE_BATCHES:
@@ -221,10 +262,12 @@ def reconcile_stale_batches(db: DbSession | None = None) -> int:
         if owned:
             local.close()
 
-def serialize(batch, db):
-    issue_count = db.query(QcIssue).filter(QcIssue.batch_id == batch.id).count()
-    issue_count += db.query(QcSliceQualityIssue).join(QcSlice).filter(QcSlice.batch_id == batch.id).count()
-    counts = _slice_counts(db, batch.id)
+def serialize(batch, db, counts=None, issue_count=None):
+    if counts is None:
+        counts = _slice_counts(db, batch.id)
+    if issue_count is None:
+        issue_count = db.query(QcIssue).filter(QcIssue.batch_id == batch.id).count()
+        issue_count += db.query(QcSliceQualityIssue).join(QcSlice).filter(QcSlice.batch_id == batch.id).count()
     return {"id":batch.id,"batch_id":batch.id,"name":batch.name,"status":batch.status,
             "total_ai_msgs":batch.total_ai_msgs or 0,"analyzed_count":counts["processed_count"],
             "total_slices":batch.total_slices or 0,"analyzed_slices":counts["processed_count"],
@@ -325,11 +368,20 @@ def _refresh_open_batch_status(db: DbSession, batch: AnalysisBatch) -> None:
         batch.updated_at = utcnow()
 
 
+def _discard_partial_parse(db: DbSession, file_id: int) -> None:
+    """Drop rows already committed for a file that later failed mid-parse."""
+    db.query(AiMessage).filter(AiMessage.uploaded_file_id == file_id).delete(synchronize_session=False)
+    db.query(QcSlice).filter(QcSlice.uploaded_file_id == file_id).delete(synchronize_session=False)
+    db.query(Session).filter(Session.uploaded_file_id == file_id).delete(synchronize_session=False)
+
+
 def _set_file_failure(db: DbSession, file_id: int, message: str, stage: str = "parse") -> UploadedFile:
     db.rollback()
     row = db.query(UploadedFile).filter(UploadedFile.id == file_id).first()
     if not row:
         raise HTTPException(404, "上传文件记录不存在")
+    if stage == "parse":
+        _discard_partial_parse(db, file_id)
     row.status = "upload_failed" if stage == "upload" else "parse_failed"
     row.error_stage = stage
     if stage == "upload":
@@ -347,7 +399,7 @@ def _set_file_failure(db: DbSession, file_id: int, message: str, stage: str = "p
 
 
 def _parse_registered_file(db: DbSession, batch: AnalysisBatch, uploaded: UploadedFile) -> UploadedFile:
-    """Parse without a write transaction, then atomically persist one file."""
+    """Parse without holding a write lock, then persist in 200-row commits."""
     batch_id = batch.id
     uploaded_id = uploaded.id
     target = uploaded.stored_path or ""
@@ -384,6 +436,8 @@ def _parse_registered_file(db: DbSession, batch: AnalysisBatch, uploaded: Upload
             next((item.get("_parse_stats") for item in sessions if isinstance(item.get("_parse_stats"), dict)), {}) or {}
         )
         message_count = 0
+        PARSE_FLUSH_SIZE = 200
+        pending_in_txn = 0
         for item in sessions:
             session = Session(
                 batch_id=batch.id, uploaded_file_id=uploaded.id,
@@ -423,9 +477,10 @@ def _parse_registered_file(db: DbSession, batch: AnalysisBatch, uploaded: Upload
                 slice_id=canonical_slice_id, channel=item.get("channel"), game=item.get("game"),
                 region=item.get("region"),
                 messages_json=json.dumps(normalized_messages, ensure_ascii=False, separators=(",", ":")),
-                analysis_status="pending", source_format=item.get("_source_format"),
+                source_format=item.get("_source_format"),
                 source_sheet=item.get("_source_sheet"), source_problem_id=item.get("session_uid"),
                 warnings_json=json.dumps(item.get("_parse_warnings") or [], ensure_ascii=False),
+                **slice_creation_fields(db, item.get("game"), item.get("region")),
             ))
             for msg in item.get("ai_messages", []):
                 db.add(AiMessage(
@@ -434,6 +489,14 @@ def _parse_registered_file(db: DbSession, batch: AnalysisBatch, uploaded: Upload
                     context=msg.get("context", ""), language=msg.get("language"),
                 ))
                 message_count += 1
+            pending_in_txn += 1
+            if pending_in_txn >= PARSE_FLUSH_SIZE:
+                db.commit()
+                pending_in_txn = 0
+                uploaded = db.query(UploadedFile).filter(UploadedFile.id == uploaded_id).first()
+                batch = db.query(AnalysisBatch).filter(AnalysisBatch.id == batch_id).first()
+                if not uploaded or not batch:
+                    raise RuntimeError("批次或上传文件记录不存在")
 
         uploaded.channel = channel
         uploaded.row_count = rows
@@ -461,9 +524,13 @@ def _parse_registered_file(db: DbSession, batch: AnalysisBatch, uploaded: Upload
         db.refresh(uploaded)
         _sync_progress(db, batch)
         return uploaded
-    except OperationalError as exc:
+    except (OperationalError, DatabaseError) as exc:
+        kind = sqlite_error_kind(exc)
+        if kind == "malformed":
+            db.rollback()
+            raise HTTPException(500, sqlite_user_message(exc, "解析入库")) from exc
         _set_file_failure(db, uploaded_id, "数据库繁忙，请稍后重试解析")
-        raise HTTPException(503, "数据库繁忙，请稍后重试解析") from exc
+        raise HTTPException(503, sqlite_user_message(exc, "解析入库")) from exc
     except Exception as exc:
         return _set_file_failure(db, uploaded_id, str(exc) or "解析结果入库失败")
 
@@ -596,13 +663,7 @@ def retry_file_parse(
         raise HTTPException(409, "当前文件状态不能重试解析")
     if not uploaded.stored_path or not os.path.isfile(uploaded.stored_path):
         raise HTTPException(409, "服务端原文件不存在，请重新选择文件上传")
-    partial_count = (
-        db.query(Session).filter(Session.uploaded_file_id == uploaded.id).count()
-        + db.query(QcSlice).filter(QcSlice.uploaded_file_id == uploaded.id).count()
-        + db.query(AiMessage).filter(AiMessage.uploaded_file_id == uploaded.id).count()
-    )
-    if partial_count:
-        raise HTTPException(409, "检测到该文件已有入库数据，为防止重复已停止重试")
+    _discard_partial_parse(db, uploaded.id)
     uploaded.status = "parsing"
     uploaded.error_stage = None
     uploaded.parse_error = None
@@ -700,9 +761,10 @@ def create_batch(name: str=Form(""), files: list[UploadFile]=File(...), user: Us
                            slice_id=canonical_slice_id,
                            channel=item.get("channel"), game=item.get("game"), region=item.get("region"),
                            messages_json=json.dumps(normalized_messages, ensure_ascii=False, separators=(",", ":")),
-                           analysis_status="pending", source_format=item.get("_source_format"),
+                           source_format=item.get("_source_format"),
                            source_sheet=item.get("_source_sheet"), source_problem_id=item.get("session_uid"),
-                           warnings_json=json.dumps(item.get("_parse_warnings") or [], ensure_ascii=False)))
+                           warnings_json=json.dumps(item.get("_parse_warnings") or [], ensure_ascii=False),
+                           **slice_creation_fields(db, item.get("game"), item.get("region"))))
             for msg in item.get("ai_messages",[]):
                 db.add(AiMessage(session_id=session.id,batch_id=batch.id,msg_time=msg.get("msg_time"),content=msg.get("content",""),context=msg.get("context",""),language=msg.get("language"))); total+=1
         # The parser's legacy keyword suggestions are intentionally ignored
@@ -753,7 +815,7 @@ def start_batch(
     _: User = Depends(require_admin),
     db: DbSession = Depends(get_db),
 ):
-    reconcile_stale_batches(db)
+    reconcile_stale_batches(db, batch_id)
     db.expire_all()
     batch = _require_batch(db, batch_id)
     if batch_id in ACTIVE_BATCHES or batch.status == "analyzing":
@@ -785,8 +847,7 @@ def start_batch(
 
 @router.post("/batch/{batch_id}/pause")
 def pause_batch(batch_id: int, _: User = Depends(require_admin), db: DbSession = Depends(get_db)):
-    reconcile_stale_batches(db)
-    db.expire_all()
+    batch = _require_batch(db, batch_id)
     batch = _require_batch(db, batch_id)
     if _is_terminal_status(batch.status) or _is_abort_requested(batch):
         raise HTTPException(409, "批次已终止或已完成，不能暂停")
@@ -815,13 +876,21 @@ def resume_batch(
     _: User = Depends(require_admin),
     db: DbSession = Depends(get_db),
 ):
-    reconcile_stale_batches(db)
-    db.expire_all()
     batch = _require_batch(db, batch_id)
-    if batch_id in ACTIVE_BATCHES or batch.status == "analyzing":
+    if batch_id in ACTIVE_BATCHES:
         raise HTTPException(409, "批次正在分析中")
     if _is_terminal_status(batch.status) or _is_abort_requested(batch):
         raise HTTPException(409, "批次已终止或已完成，不能重启")
+    if batch.status == "analyzing":
+        # A previous worker died but left analyzing in the DB. Reconcile to
+        # paused so the operator can resume remaining pending/failed slices.
+        reconcile_stale_batches(db, batch_id)
+        db.expire_all()
+        batch = _require_batch(db, batch_id)
+        if batch_id in ACTIVE_BATCHES:
+            raise HTTPException(409, "批次正在分析中")
+        if batch.status == "analyzing":
+            raise HTTPException(409, "批次正在分析中")
     if batch.status != "paused":
         raise HTTPException(409, "只有暂停中的批次可以重启")
     counts = _slice_counts(db, batch_id)
@@ -845,8 +914,6 @@ def resume_batch(
 
 @router.post("/batch/{batch_id}/abort")
 def abort_batch(batch_id: int, _: User = Depends(require_admin), db: DbSession = Depends(get_db)):
-    reconcile_stale_batches(db)
-    db.expire_all()
     batch = _require_batch(db, batch_id)
     if _is_terminal_status(batch.status):
         raise HTTPException(409, "批次已终止或已完成")
@@ -907,8 +974,6 @@ def progress(batch_id:int,token:str,db:DbSession=Depends(get_db)):
             # failed slices reclaimed as processing), which makes the cards jump.
             local=SessionLocal()
             try:
-                if batch_id not in ACTIVE_BATCHES:
-                    reconcile_stale_batches(local)
                 b=local.query(AnalysisBatch).filter(AnalysisBatch.id==batch_id).first()
                 state = _progress_payload(b, _slice_counts(local, batch_id)) if b else {"status": "failed", "error": "\u6279\u6b21\u4e0d\u5b58\u5728", "processed_count": 0, "pending_count": 0, "done": 0, "total": 0}
             finally:
@@ -920,11 +985,52 @@ def progress(batch_id:int,token:str,db:DbSession=Depends(get_db)):
 
 @router.get("/batches")
 def batches(user:User=Depends(get_current_user),db:DbSession=Depends(get_db)):
-    reconcile_stale_batches(db)
-    query = db.query(AnalysisBatch)
-    # Both supported roles may browse the review workbench.  Batch-level
-    # visibility is read-only; mutation endpoints remain administrator-only.
-    return [serialize(x,db) for x in query.order_by(AnalysisBatch.created_at.desc()).limit(100).all()]
+    # Listing must stay read-only. Reconciling stale workers here contended with
+    # live analysis writes and made History/Upload fail to load.
+    rows = db.query(AnalysisBatch).order_by(AnalysisBatch.created_at.desc()).limit(100).all()
+    batch_ids = [row.id for row in rows]
+    counts = _slice_counts_by_batch(db, batch_ids)
+    issues = _issue_counts_by_batch(db, batch_ids)
+    return [serialize(row, db, counts.get(row.id), issues.get(row.id, 0)) for row in rows]
+
+
+def _delete_batch_rows(db: DbSession, batch_id: int) -> None:
+    """Delete a batch with SQL subqueries. Never bind thousands of IDs.
+
+    SQLite rejects more than ~999 bound parameters, so ``IN (slice_id, ...)``
+    on a 7000-slice overseas file fails even when the database is healthy.
+    Large TEXT columns are deleted in chunks so one request cannot freeze the UI.
+    """
+    from sqlalchemy import text
+    params = {"bid": batch_id, "chunk": 400}
+
+    def run(sql, extra=None):
+        result = db.execute(text(sql), {**params, **(extra or {})})
+        db.commit()
+        return result.rowcount or 0
+
+    def run_chunks(sql):
+        while run(sql):
+            pass
+
+    run("PRAGMA busy_timeout=60000")
+    run("DELETE FROM review_assignment_logs WHERE assignment_id IN (SELECT id FROM review_assignments WHERE batch_id = :bid)")
+    run("DELETE FROM review_assignments WHERE batch_id = :bid")
+    run("DELETE FROM review_processing_logs WHERE item_type = 'quality_issue' AND item_id IN (SELECT qi.id FROM qc_slice_quality_issues qi JOIN qc_slices s ON s.id = qi.slice_id WHERE s.batch_id = :bid)")
+    run("DELETE FROM review_processing_logs WHERE item_type = 'knowledge_suggestion' AND item_id IN (SELECT ks.id FROM qc_slice_knowledge_suggestions ks JOIN qc_slices s ON s.id = ks.slice_id WHERE s.batch_id = :bid)")
+    run("DELETE FROM knowledge_suggestion_status_logs WHERE knowledge_suggestion_id IN (SELECT ks.id FROM qc_slice_knowledge_suggestions ks JOIN qc_slices s ON s.id = ks.slice_id WHERE s.batch_id = :bid)")
+    run("DELETE FROM qa_pool_status_logs WHERE pool_entry_id IN (SELECT e.id FROM qa_pool_entries e WHERE (e.source_item_type = 'quality_issue' AND e.source_item_id IN (SELECT qi.id FROM qc_slice_quality_issues qi JOIN qc_slices s ON s.id = qi.slice_id WHERE s.batch_id = :bid)) OR (e.source_item_type = 'knowledge_suggestion' AND e.source_item_id IN (SELECT ks.id FROM qc_slice_knowledge_suggestions ks JOIN qc_slices s ON s.id = ks.slice_id WHERE s.batch_id = :bid)))")
+    run("DELETE FROM qa_pool_entries WHERE (source_item_type = 'quality_issue' AND source_item_id IN (SELECT qi.id FROM qc_slice_quality_issues qi JOIN qc_slices s ON s.id = qi.slice_id WHERE s.batch_id = :bid)) OR (source_item_type = 'knowledge_suggestion' AND source_item_id IN (SELECT ks.id FROM qc_slice_knowledge_suggestions ks JOIN qc_slices s ON s.id = ks.slice_id WHERE s.batch_id = :bid))")
+    run("DELETE FROM qc_slice_quality_issues WHERE slice_id IN (SELECT id FROM qc_slices WHERE batch_id = :bid)")
+    run("DELETE FROM qc_slice_knowledge_suggestions WHERE slice_id IN (SELECT id FROM qc_slices WHERE batch_id = :bid)")
+    run("DELETE FROM qc_issues WHERE batch_id = :bid")
+    run("DELETE FROM kb_suggestions WHERE batch_id = :bid")
+    run_chunks("DELETE FROM ai_messages WHERE id IN (SELECT id FROM ai_messages WHERE batch_id = :bid LIMIT :chunk)")
+    run_chunks("DELETE FROM qc_slices WHERE id IN (SELECT id FROM qc_slices WHERE batch_id = :bid LIMIT :chunk)")
+    run_chunks("DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE batch_id = :bid LIMIT :chunk)")
+    run("DELETE FROM reports WHERE batch_id = :bid")
+    run("DELETE FROM uploaded_files WHERE batch_id = :bid")
+    run("DELETE FROM analysis_batches WHERE id = :bid")
 
 
 @router.delete("/batch/{batch_id}")
@@ -937,48 +1043,17 @@ def delete_batch(batch_id: int, _: User = Depends(require_admin), db: DbSession 
     batch = db.query(AnalysisBatch).filter(AnalysisBatch.id == batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在，可能已被删除")
-    if batch.status == "analyzing":
-        raise HTTPException(status_code=409, detail="批次正在分析中，暂不能删除")
+    if batch.status == "analyzing" or batch_id in ACTIVE_BATCHES:
+        raise HTTPException(status_code=409, detail="批次正在分析中，请先暂停或等分析结束后再删")
 
     try:
-        from database import (
-            KnowledgeSuggestionStatusLog, ReviewAssignment, ReviewAssignmentLog,
-            ReviewProcessingLog,
-        )
-        assignment_ids = [row.id for row in db.query(ReviewAssignment.id).filter(ReviewAssignment.batch_id == batch_id).all()]
-        if assignment_ids:
-            db.query(ReviewAssignmentLog).filter(ReviewAssignmentLog.assignment_id.in_(assignment_ids)).delete(synchronize_session=False)
-            db.query(ReviewAssignment).filter(ReviewAssignment.id.in_(assignment_ids)).delete(synchronize_session=False)
-        db.query(QcIssue).filter(QcIssue.batch_id == batch_id).delete(synchronize_session=False)
-        slice_ids = [row.id for row in db.query(QcSlice.id).filter(QcSlice.batch_id == batch_id).all()]
-        if slice_ids:
-            issue_ids = [row.id for row in db.query(QcSliceQualityIssue.id).filter(QcSliceQualityIssue.slice_id.in_(slice_ids)).all()]
-            suggestion_ids = [row.id for row in db.query(QcSliceKnowledgeSuggestion.id).filter(QcSliceKnowledgeSuggestion.slice_id.in_(slice_ids)).all()]
-            if issue_ids or suggestion_ids:
-                processing_filters = []
-                if issue_ids:
-                    processing_filters.append(("quality_issue", issue_ids))
-                if suggestion_ids:
-                    processing_filters.append(("knowledge_suggestion", suggestion_ids))
-                for item_type, item_ids in processing_filters:
-                    db.query(ReviewProcessingLog).filter(
-                        ReviewProcessingLog.item_type == item_type,
-                        ReviewProcessingLog.item_id.in_(item_ids),
-                    ).delete(synchronize_session=False)
-            if suggestion_ids:
-                db.query(KnowledgeSuggestionStatusLog).filter(
-                    KnowledgeSuggestionStatusLog.knowledge_suggestion_id.in_(suggestion_ids)
-                ).delete(synchronize_session=False)
-            db.query(QcSliceQualityIssue).filter(QcSliceQualityIssue.slice_id.in_(slice_ids)).delete(synchronize_session=False)
-            db.query(QcSliceKnowledgeSuggestion).filter(QcSliceKnowledgeSuggestion.slice_id.in_(slice_ids)).delete(synchronize_session=False)
-            db.query(QcSlice).filter(QcSlice.id.in_(slice_ids)).delete(synchronize_session=False)
-        db.query(KbSuggestion).filter(KbSuggestion.batch_id == batch_id).delete(synchronize_session=False)
-        db.query(AiMessage).filter(AiMessage.batch_id == batch_id).delete(synchronize_session=False)
-        db.query(Session).filter(Session.batch_id == batch_id).delete(synchronize_session=False)
-        db.query(UploadedFile).filter(UploadedFile.batch_id == batch_id).delete(synchronize_session=False)
-        db.query(Report).filter(Report.batch_id == batch_id).delete(synchronize_session=False)
-        db.delete(batch)
+        _delete_batch_rows(db, batch_id)
         db.commit()
+    except (OperationalError, DatabaseError) as exc:
+        db.rollback()
+        kind = sqlite_error_kind(exc)
+        status = 503 if kind == "locked" else 500
+        raise HTTPException(status_code=status, detail=sqlite_user_message(exc, "删除批次")) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"删除批次失败：{exc}")
@@ -1167,6 +1242,8 @@ async def run_analysis(batch_id):
             try:
                 slice_row = local.get(QcSlice, slice_db_id)
                 if not slice_row:
+                    return
+                if not should_analyze_from_snapshot(slice_row):
                     return
                 messages_json = slice_row.messages_json or "[]"
                 slice_id = slice_row.slice_id
