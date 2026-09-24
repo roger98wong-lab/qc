@@ -1,4 +1,5 @@
 """QC system FastAPI entrypoint."""
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -74,4 +75,6 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+    host = os.getenv("QC_HOST", "0.0.0.0")
+    port = int(os.getenv("QC_PORT", "8010"))
+    uvicorn.run(app, host=host, port=port)

@@ -24,7 +24,7 @@ from database import (
 
 router = APIRouter(prefix="/api/knowledge-pool", tags=["知识池"])
 PROCESSING_STATUSES = {"pending_entry", "organized", "excluded", "exported", "uploaded_to_jiuzhang"}
-VISIBLE_DECISIONS = {"candidate_ready", "candidate_needs_enrichment"}
+VISIBLE_DECISIONS = {"candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback"}
 
 
 def _json_list(value):

@@ -12,7 +12,9 @@ export type Coverage = 'none' | 'partial' | 'full' | 'conflict' | 'unknown'
  * MaaS must detect language from the supplied messages itself. */
 export type SliceIssueType = '答非所问' | '意图识别错误' | '无效回复' | '严重语法/乱码' | '语言错误' | '语气问题' | '疑似错误承诺'
 export type SliceSeverity = '严重' | '中级' | '一般' | '需人工复核'
-export type SliceKnowledgeDecision = 'candidate_ready' | 'candidate_needs_enrichment' | 'not_candidate' | 'manual_review' | 'no_human_answer'
+export type SliceKnowledgeDecision = 'candidate_ready' | 'candidate_needs_enrichment' | 'candidate_pending_feedback' | 'not_candidate' | 'manual_review' | 'no_human_answer'
+export type SliceValidationStatus = 'player_validated' | 'unvalidated' | 'not_applicable'
+export type SliceHandoffDecision = 'handoff_required' | 'handoff_reasonable' | 'handoff_not_required' | 'handoff_unreasonable' | 'manual_review'
 export type SliceKnowledgeCategory = '游戏玩法' | '引导流程' | '活动规则' | '道具与奖励' | '账号与登录'
 export type SliceCandidateType = SliceKnowledgeDecision
 export type SliceSpeaker = 'player' | 'ai' | 'human_agent' | 'system' | 'unknown'
@@ -58,14 +60,26 @@ export interface QualityCheck {
   has_issue: boolean
   issues: QualityIssue[]
 }
+export interface HumanHandoff {
+  decision: SliceHandoffDecision
+  handoff_occurred: boolean
+  reason_type: string
+  confidence: number
+  evidence_message_ids: string[]
+  reason: string
+  needs_manual_review: boolean
+  manual_review_reason: string | null
+}
 export interface KnowledgeSuggestion {
   answer_source: 'human_agent'
   decision: SliceKnowledgeDecision
   is_candidate: boolean
+  validation_status: SliceValidationStatus
   confidence: number
   category: SliceKnowledgeCategory | null
   question_message_ids: string[]
   answer_message_ids: string[]
+  feedback_message_ids: string[]
   evidence_message_ids: string[]
   title: string | null
   standard_questions: string[]
@@ -76,13 +90,23 @@ export interface KnowledgeSuggestion {
   needs_manual_review: boolean
   manual_review_reason: string | null
 }
+export interface TermSuggestion {
+  text: string
+  zh_cn: string
+}
+export interface TermSuggestions {
+  has_terms: boolean
+  terms: TermSuggestion[]
+}
 export interface SliceAnalysisResult {
-  schema_version: '1.0.0'
+  schema_version: '1.0.0' | '2.0.0'
   slice_id: string
   analysis_status: AnalysisStatus
   messages: SliceMessage[]
   quality_check: QualityCheck
+  human_handoff: HumanHandoff
   knowledge_suggestion: KnowledgeSuggestion
+  term_suggestions: TermSuggestions
   warnings: string[]
   errors: string[]
 }
@@ -110,7 +134,8 @@ export function validateSliceResult(result: SliceAnalysisResult, input?: SliceIn
   checkIds('knowledge.question_message_ids', suggestion.question_message_ids, 'player')
   checkIds('knowledge.answer_message_ids', suggestion.answer_message_ids, 'human_agent')
   checkIds('knowledge.evidence_message_ids', suggestion.evidence_message_ids)
-  if (suggestion.is_candidate !== ['candidate_ready', 'candidate_needs_enrichment'].includes(suggestion.decision)) errors.push('is_candidate must match decision')
+  if (suggestion.is_candidate !== ['candidate_ready', 'candidate_needs_enrichment', 'candidate_pending_feedback'].includes(suggestion.decision)) errors.push('is_candidate must match decision')
+  checkIds('knowledge.feedback_message_ids', suggestion.feedback_message_ids || [], 'player')
   if (suggestion.decision === 'candidate_ready' && (!suggestion.title || !suggestion.standard_answer || !suggestion.standard_questions.length)) errors.push('candidate_ready requires title, standard_questions and standard_answer')
   if (suggestion.decision === 'candidate_needs_enrichment' && !suggestion.title) errors.push('candidate_needs_enrichment requires title')
   if (suggestion.decision === 'not_candidate' && !suggestion.reject_reason) errors.push('not_candidate requires reject_reason')

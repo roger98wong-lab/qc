@@ -214,6 +214,7 @@ export function conversationFromCandidate(candidate: any): Conversation {
         ...(message.reference_tags || []),
         ...(candidate.question_message_ids?.includes(message.message_id) ? ['Q'] : []),
         ...(candidate.answer_message_ids?.includes(message.message_id) ? ['A'] : []),
+        ...(candidate.feedback_message_ids?.includes(message.message_id) ? ['反馈'] : []),
         ...(candidate.evidence_message_ids?.includes(message.message_id) ? ['证据消息'] : []),
       ].filter((tag, tagIndex, tags) => tags.indexOf(tag) === tagIndex),
       ...transferFormFields(message),

@@ -29,7 +29,7 @@ UPLOAD_DIR  = os.path.join(BASE_DIR, "uploads_runtime")
 REPORT_DIR  = os.path.join(BASE_DIR, "reports_runtime")
 BACKUP_DIR  = os.path.join(BASE_DIR, "backups")
 STATIC_DIR  = os.path.join(BASE_DIR, "static")
-DB_PATH     = os.path.join(BASE_DIR, "qc.db")
+DB_PATH     = os.path.join(BASE_DIR, os.getenv("QC_DB_NAME", "qc.db"))
 
 # ── 分析参数 ──────────────────────────────────
 ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "5"))  # 同时分析几条

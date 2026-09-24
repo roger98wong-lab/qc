@@ -47,6 +47,7 @@ MaaS User 消息现在以 `slice_id=<QcSlice.slice_id>` 作为第一行检索标
 
 - 空白、仅非 auto_reply 的 system、仅玩家、仅 unknown 的行不入库、不送 MaaS。
 - 至少有人工客服 / AI / auto_reply 才保留；玩家消息当上下文留下。
+- 标准渠道 AI/客服「引用后回复」JSON 只保留顶层 content；旧切片不自动修复，需重传。
 - `auto_reply` 过滤看 `is_auto`，不会因为 `speaker=system` 被误杀。
 - 不改 M 后台、海外端内、VIP 解析。
 
@@ -59,5 +60,5 @@ MaaS User 消息现在以 `slice_id=<QcSlice.slice_id>` 作为第一行检索标
 ## 明确没改
 
 - MaaS 算法、切片输入 schema、计费
-- `validate_slice_result` 的知识库决策枚举
+- 历史 1.0 分析结果的重跑（旧结果只读保留；缺转人工/术语/待验证候选时前端降级隐藏）
 - 对话气泡角色逻辑

@@ -16,10 +16,14 @@ from database import (
 router = APIRouter(prefix="/api/review-workbench", tags=["review workbench"])
 KNOWLEDGE_DECISIONS = frozenset({
     "manual_review", "candidate_needs_enrichment", "no_human_answer",
-    "not_candidate", "candidate_ready",
+    "not_candidate", "candidate_ready", "candidate_pending_feedback",
 })
-REVIEWABLE_KNOWLEDGE_DECISIONS = {"candidate_ready", "candidate_needs_enrichment"}
-ACTIONABLE_KB = frozenset({"candidate_ready", "candidate_needs_enrichment", "manual_review"})
+REVIEWABLE_KNOWLEDGE_DECISIONS = {
+    "candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback",
+}
+ACTIONABLE_KB = frozenset({
+    "candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback", "manual_review",
+})
 EXCLUDED_KB = frozenset({"not_candidate", "no_human_answer", "reject"})
 ALLOWED_KB_FILTER = ACTIONABLE_KB | {"not_candidate", "no_human_answer"}
 
@@ -174,6 +178,7 @@ _AGENT_NAME_SEPARATORS = "-－‐‑‒–—―:：/"
 _AGENT_NAME_DISCARDED = frozenset({
     "system", "auto_reply", "ai", "unknown", "系统", "用户", "玩家", "客服", "人工客服",
     "operator", "agent", "human_agent", "human",
+    "command", "slash command", "slash-command", "slash_command", "application command",
 })
 _AGENT_NAME_DISCARDED_NORMALIZED = frozenset(item.lower() for item in _AGENT_NAME_DISCARDED)
 _AGENT_NAME_ROLE_WORDS = tuple(sorted(
@@ -252,6 +257,11 @@ def _json(value, fallback):
         return fallback
 
 
+def _json_object_or_none(value):
+    data = _json(value, {})
+    return data or None
+
+
 def _status(row):
     if not row:
         return "unassigned"
@@ -320,6 +330,7 @@ def list_items(
     channel: Optional[str] = Query(None),
     game: Optional[str] = Query(None),
     region: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     user: User = Depends(get_current_user),
@@ -346,6 +357,8 @@ def list_items(
         )
         if batch_id:
             query = query.filter(QcSlice.batch_id == batch_id)
+        if search and search.strip():
+            query = query.filter(QcSlice.slice_id.contains(search.strip()))
         if issue_type:
             query = query.filter(QcSliceQualityIssue.issue_type.contains(issue_type))
         if severity:
@@ -390,6 +403,7 @@ def list_items(
                 "messages": messages,
                 "session_time": _session_time(messages, conversation),
                 "last_modified_at": _last_modified_at(issue, assignment),
+                "human_handoff": _json_object_or_none(slice_row.human_handoff_json),
                 "all_issues": [{
                     "id": x.id,
                     "issue_id": x.issue_id,
@@ -424,6 +438,8 @@ def list_items(
     )
     if batch_id:
         query = query.filter(QcSlice.batch_id == batch_id)
+    if search and search.strip():
+        query = query.filter(QcSlice.slice_id.contains(search.strip()))
     if channel:
         query = query.filter(QcSlice.channel == channel)
     if game:
@@ -455,6 +471,7 @@ def list_items(
                 "language": _slice_language(messages),
                 "decision": "not_candidate" if suggestion.decision == "reject" else suggestion.decision,
                 "maas_decision": suggestion.decision,
+                "validation_status": suggestion.validation_status,
                 "confidence": suggestion.confidence,
                 "answer_source": suggestion.answer_source,
                 "human_agent_name": _human_agent_name(messages),
@@ -475,7 +492,10 @@ def list_items(
                 "manual_review_reason": suggestion.manual_review_reason,
                 "question_message_ids": _json(suggestion.question_message_ids, []),
                 "answer_message_ids": _json(suggestion.answer_message_ids, []),
+                "feedback_message_ids": _json(suggestion.feedback_message_ids, []),
                 "evidence_message_ids": _json(suggestion.evidence_message_ids, []),
+                "term_suggestions": _json(suggestion.term_suggestions_json, {"has_terms": False, "terms": []}),
+                "human_handoff": _json_object_or_none(slice_row.human_handoff_json),
                 "created_at": suggestion.created_at.isoformat() if suggestion.created_at else None,
                 "messages": messages,
                 "session_link": conversation.session_link if conversation else None,

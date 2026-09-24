@@ -9,7 +9,7 @@ os.chdir(ROOT / "backend")
 
 from services.excel_parser import (
     _filter_standard_messages, _message_speaker, _parse_standard,
-    extract_human_kb_suggestions, parse_standard_dialogue,
+    clean_standard_message_body, extract_human_kb_suggestions, parse_standard_dialogue,
 )
 
 
@@ -92,6 +92,12 @@ class StandardSliceFilterTest(unittest.TestCase):
         self.assertEqual(_message_speaker({"role": "客服 - 李四"}), "human_agent")
         self.assertEqual(_message_speaker({"role": "🤵客服-焦思阳"}), "human_agent")
 
+    def test_discord_command_role_is_system_not_human_agent(self):
+        self.assertEqual(_message_speaker({"role": "command"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-command"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服 - command"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-谢艺"}), "human_agent")
+
     def test_player_and_uce_push_only_is_dropped(self):
         dialogue = "\n".join([_line("用户", "你好"), _line("客服-uce_push", "活动推送")])
         sessions, suggestions, _ = _parse_standard(_frame(dialogue), "DC")
@@ -122,6 +128,63 @@ class StandardSliceFilterTest(unittest.TestCase):
         msgs = _filter_standard_messages(parse_standard_dialogue(dialogue))
         self.assertEqual(msgs, [])
         self.assertEqual(extract_human_kb_suggestions(msgs, "冒险大作战", "欧美", "DC"), [])
+
+
+REPLY_JSON = (
+    '{"reference":{"author_name":"haiso","attachments":[],"message_id":"1548354389465374872",'
+    '"has_attachment":0,"channel_id":"1517407543289188403","content":"Animalparty","timestamp":1789226853},'
+    '"type":"reply","content":"s5f6656p"}'
+)
+SPLIT_REPLY_JSON = (
+    '{"reference":{"author_name":"haiso","attachments":[],"message_id":"1548354389465374872",\n'
+    '"has_attachment":0,"channel_id":"1517407543289188403","content":"Animalparty","timestamp":1789226853},\n'
+    '"type":"reply","content":"s5f6656p"}'
+)
+
+
+class StandardReplyJsonBodyTest(unittest.TestCase):
+    def test_cleaner_extracts_reply_content(self):
+        self.assertEqual(clean_standard_message_body(REPLY_JSON), "s5f6656p")
+        self.assertEqual(clean_standard_message_body("  " + REPLY_JSON + "  "), "s5f6656p")
+        self.assertEqual(clean_standard_message_body('"' + REPLY_JSON + '"'), "s5f6656p")
+        self.assertEqual(clean_standard_message_body('{"content":"hello"}'), "hello")
+        self.assertEqual(clean_standard_message_body("s5f6656p"), "s5f6656p")
+        self.assertEqual(clean_standard_message_body('{"type":"reply","reference":{},"content":""}'), "")
+
+    def test_single_line_reply_json_keeps_only_content(self):
+        dialogue = "\n".join([_line("用户", "Animalparty"), _line("AI客服", REPLY_JSON)])
+        msgs = parse_standard_dialogue(dialogue)
+        self.assertEqual([item["content"] for item in msgs], ["Animalparty", "s5f6656p"])
+        sessions, _, _ = _parse_standard(_frame(dialogue), "DC")
+        self.assertEqual(sessions[0]["slice_payload"]["messages"][1]["text"], "s5f6656p")
+        self.assertNotIn("message_id", sessions[0]["slice_payload"]["messages"][1]["text"])
+
+    def test_split_reply_json_is_cleaned_after_continuation(self):
+        first, rest = SPLIT_REPLY_JSON.split("\n", 1)
+        dialogue = _line("AI客服", first) + "\n" + rest
+        msgs = parse_standard_dialogue(dialogue)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["content"], "s5f6656p")
+        self.assertNotIn("reference", msgs[0]["content"])
+
+    def test_human_agent_reply_json_does_not_create_quoted_player_message(self):
+        dialogue = "\n".join([_line("用户", "怎么领"), _line("客服-张三", REPLY_JSON)])
+        msgs = parse_standard_dialogue(dialogue)
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[1]["content"], "s5f6656p")
+        filtered = _filter_standard_messages(msgs)
+        self.assertEqual([_message_speaker(item) for item in filtered], ["player", "human_agent"])
+        self.assertEqual([item["content"] for item in filtered], ["怎么领", "s5f6656p"])
+
+    def test_empty_reply_content_is_filtered_out(self):
+        empty_reply = '{"type":"reply","reference":{"content":"Animalparty"},"content":""}'
+        dialogue = "\n".join([_line("用户", "怎么领"), _line("AI客服", empty_reply)])
+        sessions, _, _ = _parse_standard(_frame(dialogue), "DC")
+        self.assertEqual(sessions, [])
+
+    def test_invalid_but_recognizable_reply_json_extracts_content(self):
+        broken = '{"reference":{"content":"Animalparty"},"type":"reply","content":"s5f6656p",'
+        self.assertEqual(clean_standard_message_body(broken), "s5f6656p")
 
 
 class IssuePairDefaultTest(unittest.TestCase):

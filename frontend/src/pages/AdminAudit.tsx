@@ -7,7 +7,7 @@ import { useAuthStore } from '../store/auth'
 const { Title, Text } = Typography
 
 const ANALYSIS_STATUS_LABELS: Record<string, string> = { pending: '等待分析', processing: '分析中', completed: '分析完成', partial: '部分完成', failed: '分析失败' }
-const KNOWLEDGE_DECISION_LABELS: Record<string, string> = { candidate_ready: '可直接沉淀', candidate_needs_enrichment: '需补充后沉淀', not_candidate: '不适合沉淀', reject: '不适合沉淀', manual_review: '人工复核', no_human_answer: '无人工回复' }
+const KNOWLEDGE_DECISION_LABELS: Record<string, string> = { candidate_ready: '可直接沉淀', candidate_needs_enrichment: '需补充后沉淀', candidate_pending_feedback: '待验证候选', not_candidate: '不适合沉淀', reject: '不适合沉淀', manual_review: '人工复核', no_human_answer: '无人工回复' }
 const displayValue = (value: unknown, fallback = '—'): string => {
   if (value === null || value === undefined) return fallback
   if (typeof value === 'string') return value.trim() || fallback

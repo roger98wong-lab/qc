@@ -76,6 +76,18 @@ class KnowledgeSuggestionDisplayTest(unittest.TestCase):
         ]
         self.assertIsNone(_human_agent_name(messages))
 
+    def test_human_agent_name_drops_discord_command_identity(self):
+        self.assertIsNone(_human_agent_name([
+            {"speaker": "human_agent", "speaker_source": "command"},
+        ]))
+        self.assertIsNone(_human_agent_name([
+            {"speaker": "human_agent", "speaker_source": "客服-command"},
+        ]))
+        self.assertEqual(_human_agent_name([
+            {"speaker": "human_agent", "speaker_source": "客服-command"},
+            {"speaker": "human_agent", "speaker_source": "客服-谢艺"},
+        ]), "谢艺")
+
     def test_slice_language_dedupes_in_order(self):
         messages = [
             {"source_language": "fr"},
@@ -180,9 +192,11 @@ class KnowledgeSuggestionDisplayTest(unittest.TestCase):
 
     def test_kb_entered_pool_requires_human_qa_and_actionable_decision(self):
         ready = SimpleNamespace(decision="candidate_ready", human_qa_pairs='[{"question":"q","answer":"a"}]', human_standard_questions="[]", human_standard_answer="")
+        pending = SimpleNamespace(decision="candidate_pending_feedback", human_qa_pairs='[{"question":"q","answer":"a"}]', human_standard_questions="[]", human_standard_answer="")
         review = SimpleNamespace(decision="manual_review", human_qa_pairs='[{"question":"q","answer":"a"}]', human_standard_questions="[]", human_standard_answer="")
         empty = SimpleNamespace(decision="candidate_ready", human_qa_pairs=None, human_standard_questions="[]", human_standard_answer="")
         self.assertTrue(review_router._kb_entered_pool(ready))
+        self.assertTrue(review_router._kb_entered_pool(pending))
         self.assertFalse(review_router._kb_entered_pool(review))
         self.assertFalse(review_router._kb_entered_pool(empty))
 

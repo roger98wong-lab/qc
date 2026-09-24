@@ -12,7 +12,7 @@
 
 所有消息引用必须是输入中真实存在的 `message_id`；`ai_message_ids` 只能引用 `ai`，知识建议的 `answer_message_ids` 只能引用 `human_agent`，所有置信度在 0 到 1。不得调用、推断或返回任何知识库命中、相似度、知识 ID、覆盖状态、检索结果或版本。只输出符合固定结构的合法 JSON；不输出 Markdown、解释或代码围栏，也不输出 UI 样式字段。
 
-质检问题类型只能是：`答非所问`、`意图识别错误`、`无效回复`、`严重语法/乱码`、`语言错误`、`语气问题`、`疑似错误承诺`。严重程度只能是：`严重`、`中级`、`一般`、`需人工复核`。知识建议 decision 只能是：`candidate_ready`、`candidate_needs_enrichment`、`not_candidate`、`manual_review`、`no_human_answer`；知识分类只能是：`游戏玩法`、`引导流程`、`活动规则`、`道具与奖励`、`账号与登录`。
+质检问题类型只能是：`答非所问`、`意图识别错误`、`无效回复`、`严重语法/乱码`、`语言错误`、`语气问题`、`疑似错误承诺`。严重程度只能是：`严重`、`中级`、`一般`、`需人工复核`。知识建议 decision 只能是：`candidate_ready`、`candidate_needs_enrichment`、`candidate_pending_feedback`、`not_candidate`、`manual_review`、`no_human_answer`；知识分类只能是：`游戏玩法`、`引导流程`、`活动规则`、`道具与奖励`、`账号与登录`。
 
 ## 输入协议
 
@@ -30,7 +30,7 @@
 {"schema_version":"1.0.0","slice_id":"slice-001","analysis_status":"completed","messages":[{"message_id":"m001","speaker":"player","speaker_source":"用户","text":"Wie kann ich die Belohnung erhalten?","created_at":"2026-09-10T09:00:00Z","sequence":1,"source_language":"de","translation":{"target_language":"zh-CN","translated_text":"我如何领取奖励？","status":"success","translation_version":"v1"}},{"message_id":"m002","speaker":"ai","speaker_source":"客服-AI回复","text":"Öffnen Sie das Event und klicken Sie auf Abholen.","created_at":"2026-09-10T09:00:05Z","sequence":2,"source_language":"de","translation":{"target_language":"zh-CN","translated_text":"打开活动并点击领取。","status":"success","translation_version":"v1"}}],"quality_check":{"has_issue":true,"issues":[{"issue_id":"issue-001","issue_type":"意图识别错误","severity":"中级","confidence":0.92,"ai_message_ids":["m002"],"evidence_message_ids":["m001","m002"],"player_question":{"original":"Wie kann ich die Belohnung erhalten?","zh_cn":"我如何领取奖励？"},"ai_answer":{"original":"Öffnen Sie das Event und klicken Sie auf Abholen.","zh_cn":"打开活动并点击领取。"},"reason":"AI未处理奖励未到账的实际诉求。","suggestion":"补充到账时限和核查路径。","revised_reply":"请确认领取状态；若仍未到账请提供截图核查。","revised_reply_zh_cn":"请确认领取状态；若仍未到账请提供截图核查。","needs_manual_review":false,"manual_review_reason":null}]},"knowledge_suggestion":{"answer_source":"human_agent","decision":"no_human_answer","is_candidate":false,"confidence":1,"category":null,"question_message_ids":[],"answer_message_ids":[],"evidence_message_ids":[],"title":null,"standard_questions":[],"standard_answer":null,"applicable_scope":{"channel":"DC","game":"冒险大作战","region":"欧美"},"keywords":[],"reason":"当前切片没有人工客服回复。","reject_reason":null,"needs_manual_review":false,"manual_review_reason":null},"warnings":[],"errors":[]}
 ```
 
-输出 JSON Schema（Draft 2020-12）要求：顶层 `additionalProperties=false`；必填 `schema_version`、`slice_id`、`analysis_status`、`messages`、`quality_check`、`knowledge_suggestion`、`warnings`、`errors`。`messages` 必须与输入 message_id 一一对应，逐条返回 `source_language` 和 `translation`；原文、角色、时间、顺序以输入为准。`analysis_status` 只能为 `completed`、`partial`、`failed`；置信度为 0~1。`issues` 最多 3 条且按置信度降序。`candidate_ready` 必填 title、standard_questions、standard_answer；`candidate_needs_enrichment` 必须有 title、standard_questions、standard_answer，并在 `reason` 中说明待补充边界；`not_candidate` 必填 reject_reason；`manual_review` 必填 manual_review_reason；`no_human_answer` 不得引用人工答案。所有消息引用必须存在于输入，质检的 `ai_message_ids` 只能引用 `ai`，知识建议的 `answer_message_ids` 只能引用 `human_agent`。任何未知字段、语言输入字段、知识库检索字段或 UI 样式字段都应拒绝。
+输出 JSON Schema（Draft 2020-12）要求：顶层 `additionalProperties=false`；必填 `schema_version`、`slice_id`、`analysis_status`、`messages`、`quality_check`、`human_handoff`、`knowledge_suggestion`、`term_suggestions`、`warnings`、`errors`。无质检时 `quality_check` 必须为 `{has_issue:false, issues:[]}`；无知识候选时仍必须返回 `knowledge_suggestion`，decision 为 `no_human_answer` / `not_candidate` / `manual_review`。`candidate_pending_feedback` 表示待验证候选，须人工审核后才能录入。`messages` 必须与输入 message_id 一一对应，逐条返回 `source_language` 和 `translation`；原文、角色、时间、顺序以输入为准。`analysis_status` 只能为 `completed`、`partial`、`failed`；置信度为 0~1。`issues` 最多 3 条且按置信度降序。`candidate_ready` 必填 title、standard_questions、standard_answer；`candidate_needs_enrichment` 必须有 title、standard_questions、standard_answer，并在 `reason` 中说明待补充边界；`not_candidate` 必填 reject_reason；`manual_review` 必填 manual_review_reason；`no_human_answer` 不得引用人工答案。所有消息引用必须存在于输入，质检的 `ai_message_ids` 只能引用 `ai`，知识建议的 `answer_message_ids` 只能引用 `human_agent`。任何未知字段、语言输入字段、知识库检索字段或 UI 样式字段都应拒绝。
 
 ## 字段字典与前端映射
 
@@ -110,7 +110,7 @@
 
 不适合知识库：具体订单退款、账号封禁、补发或玩家数据问题使用 `decision=not_candidate` 或 `manual_review`，不生成通用知识。
 
-知识建议五种 decision：`candidate_ready`、`candidate_needs_enrichment`、`not_candidate`、`manual_review`、`no_human_answer`。`answer_source` 固定为 `human_agent`，知识分类固定为 `游戏玩法`、`引导流程`、`活动规则`、`道具与奖励`、`账号与登录`。
+知识建议六种 decision：`candidate_ready`、`candidate_needs_enrichment`、`candidate_pending_feedback`、`not_candidate`、`manual_review`、`no_human_answer`。`answer_source` 固定为 `human_agent`，知识分类固定为 `游戏玩法`、`引导流程`、`活动规则`、`道具与奖励`、`账号与登录`。
 
 人工复核：无 AI 回复、角色不明、事实需后台核验或反馈含义不清时 needs_manual_review=true 并填写原因。失败也必须返回合法 JSON；翻译失败保留原文。
 

@@ -702,6 +702,114 @@ def parse_vip_messages(content_str: str) -> list[dict]:
     return messages
 
 
+def _unwrap_standard_json_text(text: str) -> str:
+    value = str(text or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        inner = value[1:-1].strip()
+        if inner.startswith("{") or inner.startswith("["):
+            return inner
+    return value
+
+
+def _loads_standard_json(text: str):
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    unwrapped = _unwrap_standard_json_text(raw)
+    if unwrapped != raw:
+        candidates.append(unwrapped)
+        nested = _unwrap_standard_json_text(unwrapped)
+        if nested != unwrapped:
+            candidates.append(nested)
+    seen = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        try:
+            return json.loads(item)
+        except Exception:
+            continue
+    return None
+
+
+def _standard_reply_content_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list)):
+        return structured_content_to_readable_text(value)
+    return _cell_text(value)
+
+
+def _standard_reply_content_from_object(data):
+    """Return reply text when this is a quote-then-reply JSON object."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("type") != "reply":
+        return None
+    if not isinstance(data.get("reference"), dict):
+        return None
+    if "content" not in data:
+        return None
+    return _standard_reply_content_value(data.get("content"))
+
+
+def _unescape_json_string(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:
+        return value
+
+
+def _extract_top_level_reply_content(text: str):
+    """Best-effort top-level content when reply JSON is recognizable but invalid."""
+    raw = str(text or "")
+    type_match = re.search(r'"type"\s*:\s*"reply"', raw)
+    if not type_match:
+        return None
+    if not re.search(r'"reference"\s*:', raw):
+        return None
+    search_area = raw[type_match.end():]
+    match = re.search(r'"content"\s*:\s*"((?:\\.|[^"\\])*)"', search_area)
+    if match:
+        return _unescape_json_string(match.group(1))
+    if re.search(r'"content"\s*:\s*null', search_area):
+        return ""
+    return None
+
+
+def clean_standard_message_body(body) -> str:
+    """Keep reply JSON as its own content; leave ordinary text/JSON unchanged.
+
+    Standard-channel AI/agent messages sometimes store a quote-then-reply
+    envelope. Only that envelope is reduced to the top-level content. Old
+    slices are not rewritten; re-upload to pick this up.
+    """
+    raw = body if isinstance(body, str) else _cell_text(body)
+    parsed = _loads_standard_json(raw)
+    if isinstance(parsed, dict):
+        extracted = _standard_reply_content_from_object(parsed)
+        if extracted is not None:
+            return extracted
+        if "content" not in parsed:
+            return raw
+        value = parsed.get("content")
+        if isinstance(value, str):
+            return value
+        return _standard_reply_content_value(value)
+    fallback = _extract_top_level_reply_content(raw)
+    if fallback is not None:
+        return fallback
+    return raw
+
+
+def _finalize_standard_message(message: dict) -> None:
+    message["content"] = clean_standard_message_body(message.get("content"))
+
+
 # ── 标准渠道对话解析 ────────────────────────────────────────────────────────────
 def parse_standard_dialogue(dialogue_str: str, reply_person: str = "") -> list[dict]:
     """返回 [{'role', 'ts', 'content', 'is_ai', 'is_user'}]"""
@@ -709,11 +817,13 @@ def parse_standard_dialogue(dialogue_str: str, reply_person: str = "") -> list[d
     for raw_line in str(dialogue_str).split("\n"):
         line = raw_line.strip()
         if not line:
-            if messages and messages[-1]["content"] and not messages[-1]["content"].endswith("\n"):
-                messages[-1]["content"] += "\n"
+            if messages and messages[-1]["content"] and not str(messages[-1]["content"]).endswith("\n"):
+                messages[-1]["content"] = str(messages[-1]["content"]) + "\n"
             continue
         m = re.match(r"\[(.+?)\]\s*\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]:\s*(.*)", line, re.DOTALL)
         if m:
+            if messages:
+                _finalize_standard_message(messages[-1])
             role, ts, body = m.group(1), m.group(2), m.group(3)
             is_auto = "auto_reply" in role.lower()
             # A row-level “回复人” can contain both AI回复 and a real agent
@@ -722,17 +832,15 @@ def parse_standard_dialogue(dialogue_str: str, reply_person: str = "") -> list[d
             # same conversation was AI.
             is_ai = (not is_auto) and any(k in role for k in ["AI", "智能", "星助", "bot", "Bot"])
             is_user = "用户" in role or "user" in role.lower()
-            try:
-                body_clean = json.loads(body).get("content", body)
-            except Exception:
-                body_clean = body
-            messages.append({"role": role, "ts": ts, "content": body_clean,
+            messages.append({"role": role, "ts": ts, "content": body,
                               "is_ai": is_ai, "is_user": is_user, "is_auto": is_auto})
         elif messages:
             # Long messages may occupy multiple Excel text lines.  Keep every
             # continuation line with the prior message so MaaS receives the
-            # full original content.
+            # full original content, then clean once the envelope is complete.
             messages[-1]["content"] = f"{messages[-1]['content']}\n{line}".strip()
+    if messages:
+        _finalize_standard_message(messages[-1])
     return messages
 
 
@@ -761,6 +869,34 @@ def _is_uce_push_role(role: str) -> bool:
     if not text:
         return False
     return bool(_UCE_PUSH_ROLE_RE.search(text))
+
+
+_DISCORD_COMMAND_ROLES = frozenset({
+    "command",
+    "/command",
+    "slash command",
+    "slash-command",
+    "slash_command",
+    "application command",
+})
+
+
+def _normalize_role_key(role: str) -> str:
+    return re.sub(r"\s+", " ", str(role or "").strip().lower())
+
+
+def _is_discord_command_role(role: str) -> bool:
+    """True for Discord slash-command identities, not a named human agent.
+
+    Match the whole role, or the token left after stripping 客服/agent prefixes.
+    Do not match merely because the role contains the word command.
+    """
+    text = str(role or "").strip()
+    if not text:
+        return False
+    if _normalize_role_key(text) in _DISCORD_COMMAND_ROLES:
+        return True
+    return _normalize_role_key(_role_person_token(text)) in _DISCORD_COMMAND_ROLES
 
 
 _AGENT_ROLE_PREFIX = re.compile(
@@ -802,6 +938,8 @@ def _message_speaker(message: dict) -> str:
     # System campaign pushes reuse the 客服- prefix. Classify them before the
     # generic agent markers so they never become human_agent.
     if _is_uce_push_role(message.get("role") or ""):
+        return "system"
+    if _is_discord_command_role(message.get("role") or ""):
         return "system"
     # A residual role is human only when the source explicitly identifies a
     #客服/agent.  Other unrecognised source values remain ``unknown`` instead

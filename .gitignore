@@ -2,6 +2,8 @@
 backend/.env
 backend/qc.db
 backend/qc.db.*
+backend/qc-dev.db
+backend/qc-dev.db.*
 backend/backups/
 backend/uploads/
 backend/uploads_runtime/

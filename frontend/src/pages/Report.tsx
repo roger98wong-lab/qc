@@ -98,11 +98,93 @@ function messagesWithEvidence(row: any) {
     ])),
   }))
 }
+const DECISION_LABELS: Record<string, string> = {
+  candidate_ready: '可直接沉淀',
+  candidate_needs_enrichment: '需补充后沉淀',
+  candidate_pending_feedback: '待验证候选',
+  not_candidate: '不适合沉淀',
+  reject: '不适合沉淀',
+  manual_review: '人工复核',
+  no_human_answer: '无人工回复',
+}
+const VALIDATION_STATUS_LABELS: Record<string, string> = {
+  player_validated: '玩家已明确认可',
+  unvalidated: '未经玩家明确验证',
+  not_applicable: '不适用',
+}
+const HANDOFF_DECISION_LABELS: Record<string, string> = {
+  handoff_required: '需要转人工',
+  handoff_reasonable: '转人工合理',
+  handoff_not_required: '无需转人工',
+  handoff_unreasonable: '转人工不合理',
+  manual_review: '需人工复核',
+}
+const DEFAULT_KB_DECISIONS = ['candidate_ready', 'candidate_needs_enrichment', 'candidate_pending_feedback', 'manual_review']
+const KB_DECISION_OPTIONS = [
+  { value: 'candidate_ready', label: '可直接沉淀' },
+  { value: 'candidate_needs_enrichment', label: '需补充后沉淀' },
+  { value: 'candidate_pending_feedback', label: '待验证候选' },
+  { value: 'manual_review', label: '人工复核' },
+  { value: 'not_candidate', label: '不适合沉淀' },
+  { value: 'no_human_answer', label: '无人工回复' },
+]
+const POOL_KB_DECISIONS = ['candidate_ready', 'candidate_needs_enrichment', 'candidate_pending_feedback']
+
 function AnalysisSection({ title, children }: { title: string; children: React.ReactNode }) {
   return <section className="qc-analysis-section">
     <div className="qc-analysis-section-title">{title}</div>
     <div className="qc-analysis-section-content">{children || '—'}</div>
   </section>
+}
+
+function hasDisplayText(value: unknown): boolean {
+  if (value == null) return false
+  if (typeof value === 'string') return Boolean(value.trim())
+  if (Array.isArray(value)) return value.some(hasDisplayText)
+  return true
+}
+
+function HumanHandoffCard({ handoff, onFocusMessage }: { handoff: any; onFocusMessage?: (messageId: string) => void }) {
+  if (!handoff || typeof handoff !== 'object') return null
+  const evidenceIds = Array.isArray(handoff.evidence_message_ids) ? handoff.evidence_message_ids : []
+  return <Card size="small" className="qc-analysis-card" title="转人工判断">
+    <Descriptions column={1} bordered size="small">
+      <Descriptions.Item label="转人工结论">{HANDOFF_DECISION_LABELS[handoff.decision] || displayValue(handoff.decision)}</Descriptions.Item>
+      <Descriptions.Item label="是否已转人工">{handoff.handoff_occurred ? '已转人工' : '未转人工'}</Descriptions.Item>
+      <Descriptions.Item label="原因类型">{displayValue(handoff.reason_type)}</Descriptions.Item>
+      <Descriptions.Item label="原因">{displayValue(handoff.reason)}</Descriptions.Item>
+      {handoff.needs_manual_review ? <Descriptions.Item label="人工复核原因">{displayValue(handoff.manual_review_reason)}</Descriptions.Item> : null}
+      <Descriptions.Item label="证据消息">
+        {evidenceIds.length
+          ? <Space size={[4, 4]} wrap>{evidenceIds.map((messageId: string) => <Button key={messageId} type="text" size="small" className="qc-evidence-id" onClick={() => onFocusMessage?.(messageId)}>{messageId}</Button>)}</Space>
+          : '—'}
+      </Descriptions.Item>
+    </Descriptions>
+  </Card>
+}
+
+function termDisplayName(term: any): string {
+  return displayValue(term?.text || term?.suggested_standard_term, "")
+}
+
+function termDisplayZh(term: any): string {
+  return displayValue(term?.zh_cn || term?.zh_cn_meaning, "")
+}
+
+function TermSuggestionsCard({ terms }: { terms: any; onFocusMessage?: (messageId: string) => void }) {
+  if (!terms?.has_terms || !Array.isArray(terms.terms) || !terms.terms.length) return null
+  return <Card size="small" className="qc-analysis-card" title="需检查术语">
+    <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
+      请核对这些名称是否与游戏一致，避免知识上线后 AI 客服无法召回。下列名称仅供核对，不是已确认的官方术语。
+    </Typography.Paragraph>
+    <ol className="qc-term-list" style={{ margin: 0, paddingLeft: 22 }}>
+      {terms.terms.slice(0, 3).map((term: any, index: number) => {
+        const name = termDisplayName(term)
+        const zh = termDisplayZh(term)
+        return <li key={index}>{name || "—"}{zh && zh !== name ? `（${zh}）` : ""}</li>
+      })}
+    </ol>
+  </Card>
 }
 
 function IssueAnalysisCards({ issues, messages = [], onFocusMessage }: { issues: any[]; messages?: any[]; onFocusMessage?: (messageId: string) => void }) {
@@ -115,9 +197,11 @@ function IssueAnalysisCards({ issues, messages = [], onFocusMessage }: { issues:
       return <Card key={issue.issue_id || index} size="small" className="qc-analysis-card" title={index === 0 ? '主问题（置信度最高）' : `附加问题 ${index + 1}`} extra={<Space size={4} wrap><Tag color={SEV_COLOR[issue.severity]}>{issue.severity || '—'}</Tag><Tag color="blue">{issue.issue_type || '—'}</Tag>{issue.needs_manual_review && <Tag color="warning">需人工复核</Tag>}</Space>}>
         <AnalysisSection title="玩家问题"><TextPairLines pair={playerQuestion} /></AnalysisSection>
         <AnalysisSection title="AI 回复"><TextPairLines pair={aiAnswer} /></AnalysisSection>
-        <AnalysisSection title="问题原因">{issue.reason || '—'}</AnalysisSection>
-        <AnalysisSection title="修改建议">{issue.suggestion || '—'}</AnalysisSection>
-        <AnalysisSection title="修改后参考回复"><TextPairLines pair={{ original: issue.revised_reply || '', zhCn: issue.revised_reply_zh_cn || issue.revised_reply_cn || '' }} /></AnalysisSection>
+        {hasDisplayText(issue.reason) ? <AnalysisSection title="问题原因">{issue.reason}</AnalysisSection> : null}
+        {hasDisplayText(issue.suggestion) ? <AnalysisSection title="修改建议">{issue.suggestion}</AnalysisSection> : null}
+        {(hasDisplayText(issue.revised_reply) || hasDisplayText(issue.revised_reply_zh_cn) || hasDisplayText(issue.revised_reply_cn))
+          ? <AnalysisSection title="修改后参考回复"><TextPairLines pair={{ original: issue.revised_reply || '', zhCn: issue.revised_reply_zh_cn || issue.revised_reply_cn || '' }} /></AnalysisSection>
+          : null}
         <AnalysisSection title="证据消息 ID">
           {evidenceIds.length ? <Space size={[4, 4]} wrap>{evidenceIds.map((messageId: string) => <Button key={messageId} type="text" size="small" className="qc-evidence-id" onClick={() => onFocusMessage?.(messageId)}>{messageId}</Button>)}</Space> : '—'}
         </AnalysisSection>
@@ -131,22 +215,6 @@ function IssueAnalysisCards({ issues, messages = [], onFocusMessage }: { issues:
 const { Text } = Typography
 const ISSUE_CATEGORIES = ['兜底异常', '其他待复核', '其他疑似问题', '情绪风险', '技术异常', '数据异常', '无效回复', '服务未满足', '知识错误', '知识错误/幻觉风险', '转人工问题', '风险场景未满足']
 const { RangePicker } = DatePicker
-const DECISION_LABELS: Record<string, string> = {
-  candidate_ready: '可直接沉淀',
-  candidate_needs_enrichment: '需补充后沉淀',
-  not_candidate: '不适合沉淀',
-  reject: '不适合沉淀',
-  manual_review: '人工复核',
-  no_human_answer: '无人工回复',
-}
-const DEFAULT_KB_DECISIONS = ['candidate_ready', 'candidate_needs_enrichment', 'manual_review']
-const KB_DECISION_OPTIONS = [
-  { value: 'candidate_ready', label: '可直接沉淀' },
-  { value: 'candidate_needs_enrichment', label: '需补充后沉淀' },
-  { value: 'manual_review', label: '人工复核' },
-  { value: 'not_candidate', label: '不适合沉淀' },
-  { value: 'no_human_answer', label: '无人工回复' },
-]
 const ANALYSIS_STATUS_LABELS: Record<string, string> = {
   pending: '等待分析', processing: '分析中', completed: '分析完成', partial: '部分完成', failed: '分析失败',
 }
@@ -172,7 +240,7 @@ function displayValue(value: unknown, fallback = '—'): string {
   return String(value)
 }
 
-const AGENT_NAME_DISCARDED = /^(system|auto_reply|ai|unknown|系统|用户|玩家|客服|人工客服|operator|agent|human_agent)$/i
+const AGENT_NAME_DISCARDED = /^(system|auto_reply|ai|unknown|系统|用户|玩家|客服|人工客服|operator|agent|human_agent|command|slash command|slash-command|slash_command|application command)$/i
 const AGENT_NAME_PREFIX = /^(?:人工客服|human_agent|operator|agent|客服)(?:[\s\-－‐‑‒–—―:：/、]+)/i
 const AGENT_NAME_DECORATION = /^[^\p{L}\p{N}]+/u
 
@@ -214,15 +282,70 @@ function formatDisplayTime(value: unknown): string {
 }
 
 const LANGUAGE_LABELS: Record<string, string> = {
-  'zh-CN': '中文', zh: '中文', en: '英语', 'en-US': '英语', 'en-GB': '英语',
-  de: '德语', ru: '俄语', ja: '日语', ko: '韩语', fr: '法语', es: '西班牙语',
+  zh_cn: '中文（简体）', zh_tw: '中文（繁体）',
+  vn: '越南语', vi: '越南语',
+  tr: '土耳其语', tl: '塔加路语（菲律宾语）', th: '泰语', ms: '马来语',
+  sv: '瑞典语', ru: '俄语', pt: '葡萄牙语', pl: '波兰语',
+  no: '挪威语', nb: '挪威语', nn: '挪威语',
+  nl: '荷兰语', ko: '韩语', ja: '日语', it: '意大利语',
+  id: '印度尼西亚语', fr: '法语', es: '西班牙语', en: '英语',
+  el: '希腊语', de: '德语', ar: '阿拉伯语', ara: '阿拉伯语', hi: '印地语',
+  aa: '阿法尔语', ab: '阿布哈兹语', ae: '阿维斯陀语', af: '南非荷兰语', ak: '阿坎语',
+  am: '阿姆哈拉语', an: '阿拉贡语', as: '阿萨姆语', av: '阿瓦尔语', ay: '艾马拉语',
+  az: '阿塞拜疆语', ba: '巴什基尔语', be: '白俄罗斯语', bg: '保加利亚语', bh: '比哈尔语',
+  bi: '比斯拉马语', bm: '班巴拉语', bn: '孟加拉语', bo: '藏语', br: '布列塔尼语',
+  bs: '波斯尼亚语', ca: '加泰罗尼亚语', ce: '车臣语', ch: '查莫罗语', co: '科西嘉语',
+  cr: '克里语', cs: '捷克语', cu: '教会斯拉夫语', cv: '楚瓦什语', cy: '威尔士语',
+  da: '丹麦语', dv: '迪维希语', dz: '宗喀语', ee: '埃维语', eo: '世界语',
+  et: '爱沙尼亚语', eu: '巴斯克语', fa: '波斯语', ff: '富拉语', fi: '芬兰语',
+  fj: '斐济语', fo: '法罗语', fy: '西弗里西亚语', ga: '爱尔兰语', gd: '苏格兰盖尔语',
+  gl: '加利西亚语', gn: '瓜拉尼语', gu: '古吉拉特语', gv: '马恩岛语', ha: '豪萨语',
+  he: '希伯来语', ho: '希里莫图语', hr: '克罗地亚语', ht: '海地克里奥尔语', hu: '匈牙利语',
+  hy: '亚美尼亚语', hz: '赫雷罗语', ia: '国际语', ie: '西方国际语', ig: '伊博语',
+  ii: '彝语', ik: '伊努皮克语', io: '伊多语', is: '冰岛语', iu: '因纽特语',
+  jv: '爪哇语', ka: '格鲁吉亚语', kg: '刚果语', ki: '基库尤语', kj: '宽亚玛语',
+  kk: '哈萨克语', kl: '格陵兰语', km: '高棉语', kn: '卡纳达语', kr: '卡努里语',
+  ks: '克什米尔语', ku: '库尔德语', kv: '科米语', kw: '康沃尔语', ky: '吉尔吉斯语',
+  la: '拉丁语', lb: '卢森堡语', lg: '卢干达语', li: '林堡语', ln: '林加拉语',
+  lo: '老挝语', lt: '立陶宛语', lu: '卢巴-加丹加语', lv: '拉脱维亚语', mg: '马达加斯加语',
+  mh: '马绍尔语', mi: '毛利语', mk: '马其顿语', ml: '马拉雅拉姆语', mn: '蒙古语',
+  mr: '马拉地语', mt: '马耳他语', my: '缅甸语', na: '瑙鲁语', nd: '北恩德贝莱语',
+  ne: '尼泊尔语', ng: '恩敦加语', nr: '南恩德贝莱语', nv: '纳瓦霍语', ny: '齐切瓦语',
+  oc: '奥克语', oj: '奥吉布瓦语', om: '奥罗莫语', or: '奥里亚语', os: '奥塞梯语',
+  pa: '旁遮普语', pi: '巴利语', ps: '普什图语', qu: '克丘亚语', rm: '罗曼什语',
+  rn: '基隆迪语', ro: '罗马尼亚语', rw: '卢旺达语', sa: '梵语', sc: '撒丁语',
+  sd: '信德语', se: '北萨米语', sg: '桑戈语', si: '僧伽罗语', sk: '斯洛伐克语',
+  sl: '斯洛文尼亚语', sm: '萨摩亚语', sn: '绍纳语', so: '索马里语', sq: '阿尔巴尼亚语',
+  sr: '塞尔维亚语', ss: '斯瓦蒂语', st: '南索托语', su: '巽他语', sw: '斯瓦希里语',
+  ta: '泰米尔语', te: '泰卢固语', tg: '塔吉克语', ti: '提格利尼亚语', tk: '土库曼语',
+  tn: '茨瓦纳语', to: '汤加语', ts: '聪加语', tt: '鞑靼语', tw: '契维语',
+  ty: '塔希提语', ug: '维吾尔语', uk: '乌克兰语', ur: '乌尔都语', uz: '乌兹别克语',
+  ve: '文达语', vo: '沃拉普克语', wa: '瓦隆语', wo: '沃洛夫语', xh: '科萨语',
+  yi: '意第绪语', yo: '约鲁巴语', za: '壮语', zu: '祖鲁语',
 }
+
+const LANGUAGE_ALIAS: Record<string, string> = {
+  zh: 'zh_cn', 'zh-cn': 'zh_cn', 'zh_cn': 'zh_cn', 'zh-hans': 'zh_cn', 'zh_hans': 'zh_cn',
+  'zh-tw': 'zh_tw', 'zh_tw': 'zh_tw', 'zh-hant': 'zh_tw', 'zh_hant': 'zh_tw', 'zh-hk': 'zh_tw', 'zh_hk': 'zh_tw',
+  'zh-mo': 'zh_tw', 'zh_mo': 'zh_tw',
+  vn: 'vn', vi: 'vn',
+  ara: 'ar', he: 'he', iw: 'he', jw: 'jv', 'in': 'id',
+}
+
 const INVALID_SOURCE_LANGUAGES = new Set(['unknown', 'und', 'null', 'none', 'n/a', 'na', ''])
 
-function validSourceLanguage(value: unknown): string | null {
+function normalizeLanguageCode(value: unknown): string | null {
   const text = String(value ?? '').trim()
   if (!text || INVALID_SOURCE_LANGUAGES.has(text.toLowerCase())) return null
-  return text
+  const lower = text.replace(/-/g, '_').toLowerCase()
+  if (LANGUAGE_ALIAS[lower]) return LANGUAGE_ALIAS[lower]
+  const base = lower.split('_')[0]
+  if (LANGUAGE_ALIAS[base]) return LANGUAGE_ALIAS[base]
+  return base || lower
+}
+
+function languageLabel(code: string): string {
+  return LANGUAGE_LABELS[code] || LANGUAGE_LABELS[code.split('_')[0]] || code
 }
 
 function displayLanguages(language: unknown, messages: any[] = []): string {
@@ -233,15 +356,16 @@ function displayLanguages(language: unknown, messages: any[] = []): string {
   const labels: string[] = []
   const seen = new Set<string>()
   for (const value of raw) {
-    const code = validSourceLanguage(value)
+    const code = normalizeLanguageCode(value)
     if (!code) continue
-    const label = LANGUAGE_LABELS[code] || code
+    const label = languageLabel(code)
     if (!label || seen.has(label)) continue
     seen.add(label)
     labels.push(label)
   }
   return labels.join('、') || '—'
 }
+
 
 function decisionLabel(value: unknown): string {
   const raw = displayValue(value, '')
@@ -346,6 +470,7 @@ export default function Report() {
     channel: filters.channel,
     game: filters.game,
     region: filters.region,
+    search: search.trim() || undefined,
     page,
     page_size: pageSize,
   })
@@ -647,7 +772,7 @@ export default function Report() {
           <Table
             className="review-table qc-kb-table"
             rowKey="id" dataSource={kbList} columns={kbColumns}
-            rowSelection={isAdmin ? { selectedRowKeys, onChange: setSelectedRowKeys, getCheckboxProps: (row: any) => ({ disabled: !['candidate_ready', 'candidate_needs_enrichment'].includes(row.decision) }) } : undefined}
+            rowSelection={isAdmin ? { selectedRowKeys, onChange: setSelectedRowKeys, getCheckboxProps: (row: any) => ({ disabled: !POOL_KB_DECISIONS.includes(row.decision) }) } : undefined}
             loading={kbLoading} scroll={{ x: 1580 }}
             pagination={{ current: page, pageSize, total, showSizeChanger: true, pageSizeOptions: ['20','50','100','200','500'], showTotal: n => `共 ${n} 条`, onChange: (p, ps) => { setPage(p); if (ps !== pageSize) { setPageSize(ps); setPage(1) } } }}
             size="small"
@@ -675,6 +800,7 @@ export default function Report() {
         ...(m.role === 'ai' ? ['上下文'] : []),
         ...((kbDetail.answer_message_ids || []).includes(m.message_id) ? ['A', '证据'] : []),
         ...((kbDetail.question_message_ids || []).includes(m.message_id) ? ['Q'] : []),
+        ...((kbDetail.feedback_message_ids || []).includes(m.message_id) ? ['反馈'] : []),
       ])),
     })),
   }) : null
@@ -744,7 +870,7 @@ export default function Report() {
             options={KB_DECISION_OPTIONS}
           />}
           <Select placeholder="选择优先级" style={{ width: 100 }} allowClear value={priority} onChange={v => setPriority(v)} options={['P0','P1','P2','P3'].map(v => ({value:v,label:v}))} />
-          <Input.Search value={search} onChange={e => setSearch(e.target.value)} onSearch={loadData} placeholder="搜索会话、产品或对话内容" style={{width:240}} allowClear />
+          <Input.Search value={search} onChange={e => setSearch(e.target.value)} onSearch={loadData} placeholder="搜索切片ID、会话、产品或对话内容" style={{width:240}} allowClear />
           <Button icon={<FilterOutlined />} type="primary" onClick={loadData} loading={loading}>查询</Button>
           <Button onClick={() => { setFilters({}); setPriority(undefined); setReviewerId(undefined); setDecision(DEFAULT_KB_DECISIONS); setSearch(''); setTimeRange(null); setAssignmentStatus('all'); setPage(1) }}>重置</Button>
           {isAdmin && <Button onClick={() => reportApi.exportExcel({ batch_id: batchId, ...filters })} icon={<DownloadOutlined />}>
@@ -831,6 +957,7 @@ export default function Report() {
                   <Descriptions.Item label="会话时间"><Tooltip title={displayValue(detail.session_time)}>{formatDisplayTime(detail.session_time)}</Tooltip></Descriptions.Item>
                   <Descriptions.Item label="最后修改时间"><Tooltip title={displayValue(detail.last_modified_at)}>{formatDisplayTime(detail.last_modified_at)}</Tooltip></Descriptions.Item>
                 </Descriptions>}
+                <HumanHandoffCard handoff={detail.human_handoff} onFocusMessage={focusDetailMessage} />
                 <IssueAnalysisCards issues={detailIssues} messages={detail?.messages || []} onFocusMessage={focusDetailMessage} />
                 <Collapse
                   activeKey={detailConversationOpen ? ['conversation'] : []}
@@ -881,7 +1008,9 @@ export default function Report() {
             {isAdmin && <Button danger size="small" onClick={() => forceReleaseReview(kbDetail)}>强制释放锁</Button>}
           </Space>}
           <Descriptions className="qc-detail-descriptions qc-detail-summary" column={{ xs: 1, sm: 2 }} bordered size="small">
-            <Descriptions.Item label="候选决策"><Tag color={kbDetail.decision === 'candidate_ready' ? 'success' : kbDetail.decision === 'manual_review' ? 'warning' : 'purple'}>{decisionLabel(kbDetail.decision)}</Tag></Descriptions.Item>
+            <Descriptions.Item label="候选决策"><Tag color={kbDetail.decision === 'candidate_ready' ? 'success' : kbDetail.decision === 'manual_review' ? 'warning' : kbDetail.decision === 'candidate_pending_feedback' ? 'gold' : 'purple'}>{decisionLabel(kbDetail.decision)}</Tag></Descriptions.Item>
+            {kbDetail.decision === 'candidate_pending_feedback' ? <Descriptions.Item label="审核说明">尚无明确玩家正向反馈，须人工审核后才能录入。</Descriptions.Item> : null}
+            <Descriptions.Item label="验证状态">{VALIDATION_STATUS_LABELS[kbDetail.validation_status] || displayValue(kbDetail.validation_status)}</Descriptions.Item>
             <Descriptions.Item label="置信度">{typeof kbDetail.confidence === 'number' ? `${Math.round(kbDetail.confidence * 100)}%` : '—'}</Descriptions.Item>
             <Descriptions.Item label="需要人工复核">{kbDetail.needs_manual_review ? <Tag color="warning">是</Tag> : <Tag>否</Tag>}</Descriptions.Item>
             <Descriptions.Item label="来源"><Tag color="green">人工客服</Tag></Descriptions.Item>
@@ -896,6 +1025,7 @@ export default function Report() {
             <Descriptions.Item label="最后修改时间"><Tooltip title={displayValue(kbDetail.last_modified_at)}>{formatDisplayTime(kbDetail.last_modified_at)}</Tooltip></Descriptions.Item>
           </Descriptions>
           {kbDetail.decision === 'no_human_answer' && <Card size="small" type="inner" title="无人工回复">当前切片不生成知识库建议。</Card>}
+          <TermSuggestionsCard terms={kbDetail.term_suggestions} />
           <Collapse activeKey={kbConversationOpen ? ['conversation'] : []} onChange={keys => setKbConversationOpen((keys as string[]).includes('conversation'))} items={[{ key: 'conversation', label: '完整对话（AI 消息仅作上下文）', children: <ConversationMessageList conversation={kbConversation} focusMessageId={kbFocusedMessageId} onFocusHandled={() => setKbFocusedMessageId(null)} emptyText="当前记录没有可展示的原始消息" /> }]} />
           <Descriptions column={1} bordered size="small">
             <Descriptions.Item label="建议标题">{displayValue(kbDetail.title)}</Descriptions.Item>

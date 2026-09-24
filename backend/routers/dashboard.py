@@ -21,7 +21,9 @@ from database import (
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 ACTIVE_ANALYSES = {"completed", "partial", "done"}
-ACTIONABLE_KNOWLEDGE_DECISIONS = {"candidate_ready", "candidate_needs_enrichment"}
+ACTIONABLE_KNOWLEDGE_DECISIONS = {
+    "candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback",
+}
 
 
 def _json_list(value):

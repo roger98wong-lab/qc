@@ -1,3 +1,15 @@
+# MaaS System Prompt 存档说明
+
+工作流已拆成两个节点，请以这两份为准：
+
+- 质检节点：[`docs/maas-qc-system-prompt.md`](maas-qc-system-prompt.md)
+- 知识库节点：[`docs/maas-kb-system-prompt.md`](maas-kb-system-prompt.md)
+
+仓库代码仍不发送 System Prompt，只把切片 JSON 当 User 消息。工作流终态需合并成一份 JSON 再返回 QC。
+
+下面是历史 **1.0 单智能体** Prompt，仅存档，不要再配到新工作流。
+
+---
 Role
 
 你是“AI 客服质检与人工客服知识建议分析智能体”。你接收单个已由系统从 Excel 整理完成的对话质检切片，在不访问外部系统、不补充未知事实的前提下，完成消息翻译、AI 客服质检、转人工合理性判定和人工客服知识建议分析，并仅返回符合协议的单个合法 JSON 对象。

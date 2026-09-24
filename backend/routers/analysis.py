@@ -1177,22 +1177,29 @@ def _persist_slice_result(db, batch: AnalysisBatch, slice_row: QcSlice, result, 
             needs_manual_review=bool(issue.get("needs_manual_review")),
             manual_review_reason=issue.get("manual_review_reason"), is_primary=index == 0,
         ))
+    handoff = result.get("human_handoff")
+    slice_row.human_handoff_json = json.dumps(handoff, ensure_ascii=False) if isinstance(handoff, dict) else None
     knowledge = result.get("knowledge_suggestion") or {}
-    has_human_agent = any(message.get("speaker") == "human_agent" for message in (json.loads(slice_row.messages_json or "[]")))
-    if knowledge and has_human_agent:
-        slice_row.knowledge_decision = knowledge.get("decision")
-        slice_row.knowledge_is_candidate = knowledge.get("decision") in {
-            "candidate_ready", "candidate_needs_enrichment"
+    if knowledge:
+        decision = knowledge.get("decision") or "no_human_answer"
+        slice_row.knowledge_decision = decision
+        slice_row.knowledge_is_candidate = decision in {
+            "candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback",
         }
+        terms = result.get("term_suggestions") or {"has_terms": False, "terms": []}
         db.add(QcSliceKnowledgeSuggestion(
             slice_id=slice_row.id, answer_source=knowledge.get("answer_source") or "human_agent",
-            decision=knowledge.get("decision") or "no_human_answer", confidence=knowledge.get("confidence"),
+            decision=decision, confidence=knowledge.get("confidence"),
             category=knowledge.get("category"),
+            validation_status=knowledge.get("validation_status"),
             question_message_ids=json.dumps(knowledge.get("question_message_ids") or [], ensure_ascii=False),
             answer_message_ids=json.dumps(knowledge.get("answer_message_ids") or [], ensure_ascii=False),
+            feedback_message_ids=json.dumps(knowledge.get("feedback_message_ids") or [], ensure_ascii=False),
             evidence_message_ids=json.dumps(knowledge.get("evidence_message_ids") or [], ensure_ascii=False),
+            term_suggestions_json=json.dumps(terms, ensure_ascii=False),
             title=knowledge.get("title"), standard_questions=json.dumps(knowledge.get("standard_questions") or [], ensure_ascii=False),
             standard_answer=knowledge.get("standard_answer"), applicable_scope=json.dumps(knowledge.get("applicable_scope"), ensure_ascii=False) if knowledge.get("applicable_scope") is not None else None,
+            keywords=json.dumps(knowledge.get("keywords") or [], ensure_ascii=False),
             reason=knowledge.get("reason"),
             reject_reason=knowledge.get("reject_reason"), needs_manual_review=bool(knowledge.get("needs_manual_review")),
             manual_review_reason=knowledge.get("manual_review_reason"),

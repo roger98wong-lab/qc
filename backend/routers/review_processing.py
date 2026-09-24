@@ -162,7 +162,9 @@ def _assignment(db: Session, item_type: str, item_id: int):
 
 ACTIVE_ASSIGNMENT = frozenset({"pending", "in_progress", "returned"})
 WRITABLE_ASSIGNMENT = ACTIVE_ASSIGNMENT | {"completed"}
-POOL_KB_DECISIONS = frozenset({"candidate_ready", "candidate_needs_enrichment"})
+POOL_KB_DECISIONS = frozenset({
+    "candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback",
+})
 WASTE_KB_DECISIONS = frozenset({"not_candidate", "no_human_answer", "reject"})
 KNOWLEDGE_OPTIMIZE_TAG = "知识库优化"
 

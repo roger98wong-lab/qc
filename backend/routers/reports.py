@@ -540,7 +540,7 @@ def list_kb_suggestions(
     ]
     nq = db.query(QcSliceKnowledgeSuggestion, QcSlice).join(
         QcSlice, QcSliceKnowledgeSuggestion.slice_id == QcSlice.id
-    ).filter(QcSliceKnowledgeSuggestion.decision.in_(["candidate_ready", "candidate_needs_enrichment"]))
+    ).filter(QcSliceKnowledgeSuggestion.decision.in_(["candidate_ready", "candidate_needs_enrichment", "candidate_pending_feedback"]))
     if batch_id: nq = nq.filter(QcSlice.batch_id == batch_id)
     if game: nq = nq.filter(QcSlice.game.contains(game))
     if region: nq = nq.filter(QcSlice.region.contains(region))

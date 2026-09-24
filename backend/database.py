@@ -305,6 +305,7 @@ class QcSlice(Base):
     quality_issue_count = Column(Integer, default=0)
     knowledge_decision = Column(String(40), nullable=True)
     knowledge_is_candidate = Column(Boolean, nullable=True)
+    human_handoff_json = Column(Text, nullable=True)
     analysis_version    = Column(String(100), nullable=True)
     prompt_version      = Column(String(100), nullable=True)
     maas_request_id     = Column(String(200), nullable=True)
@@ -393,9 +394,12 @@ class QcSliceKnowledgeSuggestion(Base):
     decision              = Column(String(40), nullable=False)
     confidence            = Column(Float, nullable=True)
     category              = Column(String(50), nullable=True)
+    validation_status     = Column(String(30), nullable=True)
     question_message_ids  = Column(Text, nullable=False, default="[]")
     answer_message_ids    = Column(Text, nullable=False, default="[]")
+    feedback_message_ids  = Column(Text, nullable=False, default="[]")
     evidence_message_ids  = Column(Text, nullable=False, default="[]")
+    term_suggestions_json = Column(Text, nullable=False, default="{\"has_terms\": false, \"terms\": []}")
     title                 = Column(String(300), nullable=True)
     standard_questions    = Column(Text, nullable=False, default="[]")
     standard_answer       = Column(Text, nullable=True)
@@ -793,11 +797,21 @@ def init_db():
             "human_review_comment": "TEXT",
             "human_updated_by": "INTEGER",
             "human_updated_at": "DATETIME",
+            "validation_status": "VARCHAR(30)",
+            "feedback_message_ids": "TEXT DEFAULT '[]'",
+            "term_suggestions_json": "TEXT DEFAULT '{\"has_terms\": false, \"terms\": []}'",
         }
         with engine.begin() as conn:
             for name, definition in additions.items():
                 if name not in columns:
                     conn.execute(text(f"ALTER TABLE qc_slice_knowledge_suggestions ADD COLUMN {name} {definition}"))
+
+    if "qc_slices" in inspector.get_table_names():
+        columns = {c["name"] for c in inspector.get_columns("qc_slices")}
+        if "human_handoff_json" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE qc_slices ADD COLUMN human_handoff_json TEXT"))
+
     with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_qc_slices_batch_id ON qc_slices(batch_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_sessions_batch_id ON sessions(batch_id)"))
