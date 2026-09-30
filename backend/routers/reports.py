@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, FileResponse, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 from typing import Optional
+from query_filters import csv_ints, csv_texts
 
 from database import (get_db, User, QcIssue, KbSuggestion, AnalysisBatch, Report,
                       QcSlice, QcSliceQualityIssue, QcSliceKnowledgeSuggestion, Session, ReviewAssignment, utcnow)
@@ -159,19 +160,19 @@ def list_issues(
     return paged
 
 
-def _legacy_issue_base(db, batch_id: Optional[int]):
+def _legacy_issue_base(db, batch_ids: Optional[list[int]] = None):
     query = db.query(QcIssue)
-    if batch_id:
-        query = query.filter(QcIssue.batch_id == batch_id)
+    if batch_ids:
+        query = query.filter(QcIssue.batch_id.in_(batch_ids))
     return query
 
 
-def _primary_slice_issue_base(db, batch_id: Optional[int]):
+def _primary_slice_issue_base(db, batch_ids: Optional[list[int]] = None):
     query = db.query(QcSliceQualityIssue).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
         QcSliceQualityIssue.is_primary.is_(True),
     )
-    if batch_id:
-        query = query.filter(QcSlice.batch_id == batch_id)
+    if batch_ids:
+        query = query.filter(QcSlice.batch_id.in_(batch_ids))
     return query
 
 
@@ -188,6 +189,7 @@ def _distinct_values(query, column):
 @router.get("/stats", summary="统计概览")
 def get_stats(
     batch_id: Optional[int] = Query(None),
+    batch_ids: Optional[str] = Query(None),
     db: DbSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -195,8 +197,9 @@ def get_stats(
     if current_user.role not in {"admin", "analyst"}:
         raise HTTPException(403, "需要质检员或管理员权限")
 
-    legacy = _legacy_issue_base(db, batch_id)
-    slice_q = _primary_slice_issue_base(db, batch_id)
+    selected_batches = csv_ints(batch_ids, batch_id)
+    legacy = _legacy_issue_base(db, selected_batches)
+    slice_q = _primary_slice_issue_base(db, selected_batches)
     severity_counts = Counter()
     type_counts = Counter()
     _add_counts(severity_counts, legacy.with_entities(QcIssue.severity, func.count(QcIssue.id)).group_by(QcIssue.severity).all())
@@ -209,30 +212,29 @@ def get_stats(
     sessions = _distinct_values(legacy, QcIssue.session_uid) | _distinct_values(
         db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
             QcSliceQualityIssue.is_primary.is_(True),
-            *((QcSlice.batch_id == batch_id,) if batch_id else ()),
+            *((QcSlice.batch_id.in_(selected_batches),) if selected_batches else ()),
         ),
         QcSlice.slice_id,
     )
     channels = _distinct_values(legacy, QcIssue.channel) | _distinct_values(
         db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
             QcSliceQualityIssue.is_primary.is_(True),
-            *((QcSlice.batch_id == batch_id,) if batch_id else ()),
+            *((QcSlice.batch_id.in_(selected_batches),) if selected_batches else ()),
         ),
         QcSlice.channel,
     )
     games = _distinct_values(legacy, QcIssue.game) | _distinct_values(
         db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id).filter(
             QcSliceQualityIssue.is_primary.is_(True),
-            *((QcSlice.batch_id == batch_id,) if batch_id else ()),
+            *((QcSlice.batch_id.in_(selected_batches),) if selected_batches else ()),
         ),
         QcSlice.game,
     )
 
     total_ai_msgs = 0
-    if batch_id:
-        b = db.query(AnalysisBatch.total_slices, AnalysisBatch.total_ai_msgs).filter(AnalysisBatch.id == batch_id).first()
-        if b:
-            total_ai_msgs = b.total_slices or b.total_ai_msgs or 0
+    if selected_batches:
+        rows = db.query(AnalysisBatch.total_slices, AnalysisBatch.total_ai_msgs).filter(AnalysisBatch.id.in_(selected_batches)).all()
+        total_ai_msgs = sum((row.total_slices or row.total_ai_msgs or 0) for row in rows)
 
     return {
         "total_issues": legacy_total + slice_total,
@@ -252,18 +254,20 @@ def get_stats(
 @router.get("/filter-options", summary="获取筛选选项")
 def filter_options(
     batch_id: Optional[int] = Query(None),
+    batch_ids: Optional[str] = Query(None),
     db: DbSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.role not in {"admin", "analyst"}:
         raise HTTPException(403, "需要质检员或管理员权限")
-    legacy = _legacy_issue_base(db, batch_id)
+    selected_batches = csv_ints(batch_ids, batch_id)
+    legacy = _legacy_issue_base(db, selected_batches)
     slice_rows = db.query(QcSlice).join(QcSliceQualityIssue, QcSliceQualityIssue.slice_id == QcSlice.id)
-    if batch_id:
-        slice_rows = slice_rows.filter(QcSlice.batch_id == batch_id)
+    if selected_batches:
+        slice_rows = slice_rows.filter(QcSlice.batch_id.in_(selected_batches))
     slice_issues = db.query(QcSliceQualityIssue).join(QcSlice, QcSliceQualityIssue.slice_id == QcSlice.id)
-    if batch_id:
-        slice_issues = slice_issues.filter(QcSlice.batch_id == batch_id)
+    if selected_batches:
+        slice_issues = slice_issues.filter(QcSlice.batch_id.in_(selected_batches))
     severities = _distinct_values(legacy, QcIssue.severity) | _distinct_values(slice_issues, QcSliceQualityIssue.severity)
     issue_types = _distinct_values(legacy, QcIssue.issue_type) | _distinct_values(slice_issues, QcSliceQualityIssue.issue_type)
     channels = _distinct_values(legacy, QcIssue.channel) | _distinct_values(slice_rows, QcSlice.channel)
@@ -429,6 +433,7 @@ def list_reports(
 @router.get("/export-excel", summary="导出质检问题为Excel")
 def export_excel(
     batch_id: Optional[int] = Query(None),
+    batch_ids: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
     channel: Optional[str] = Query(None),
     game: Optional[str] = Query(None),
@@ -441,11 +446,16 @@ def export_excel(
     import io
 
     q = db.query(QcIssue)
-    if batch_id: q = q.filter(QcIssue.batch_id == batch_id)
-    if severity: q = q.filter(QcIssue.severity == severity)
-    if channel:  q = q.filter(QcIssue.channel == channel)
-    if game:     q = q.filter(QcIssue.game.contains(game))
-    if region:   q = q.filter(QcIssue.region.contains(region))
+    selected_batches = csv_ints(batch_ids, batch_id)
+    selected_severities = csv_texts(severity)
+    selected_channels = csv_texts(channel)
+    selected_games = csv_texts(game)
+    selected_regions = csv_texts(region)
+    if selected_batches: q = q.filter(QcIssue.batch_id.in_(selected_batches))
+    if selected_severities: q = q.filter(QcIssue.severity.in_(selected_severities))
+    if selected_channels:  q = q.filter(QcIssue.channel.in_(selected_channels))
+    if selected_games:     q = q.filter(QcIssue.game.in_(selected_games))
+    if selected_regions:   q = q.filter(QcIssue.region.in_(selected_regions))
     issues = q.order_by(QcIssue.batch_id, QcIssue.id).all()
 
     rows = []

@@ -62,6 +62,7 @@ export const analysisApi = {
     fd.append('client_file_id', clientFileId)
     fd.append('file', file)
     return api.post(`/analysis/batch/${batchId}/files`, fd, {
+      timeout: 120000,
       onUploadProgress: event => {
         if (event.total) onUploadProgress?.(Math.min(100, Math.round(event.loaded / event.total * 100)))
       },
@@ -78,8 +79,8 @@ export const analysisApi = {
 export const reportApi = {
   getIssues: (params: object) => api.get('/reports/issues', { params }),
   updateIssue: (id: number, data: object) => api.patch(`/reports/issues/${id}`, data),
-  getStats: (params: object) => api.get('/reports/stats', { params }),
-  getFilterOptions: (params: object) => api.get('/reports/filter-options', { params }),
+  getStats: (params: object, config?: object) => api.get('/reports/stats', { params, ...config }),
+  getFilterOptions: (params: object, config?: object) => api.get('/reports/filter-options', { params, ...config }),
   generateReport: (data: object) => api.post('/reports/generate', data),
   listReports: (params: object) => api.get('/reports/list', { params }),
   viewReport: (id: number) => `/api/reports/${id}/html`,
@@ -119,6 +120,7 @@ export const adminApi = {
   deleteGameAiConfig: (id: number) => api.delete(`/admin/game-ai-configs/${id}`),
   listAuditSlices: (params?: object) => api.get('/admin/audit/slices', { params }),
   getAuditSlice: (id: number | string) => api.get(`/admin/audit/slices/${id}`),
+  getHandoffTop: (params?: object) => api.get('/admin/audit/handoff-top', { params }),
   listAuditLogs: (params?: object) => api.get('/admin/audit-logs', { params }),
   getAuditLogOptions: () => api.get('/admin/audit-logs/options'),
   exportAuditLogs: (params?: object) => api.get('/admin/audit-logs/export', { params, responseType: 'blob' }),
@@ -151,7 +153,7 @@ export const reviewApi = {
 
 // Unified read model used by the /report review workbench.
 export const reviewWorkbenchApi = {
-  listItems: (params?: Record<string, unknown>) => api.get('/review-workbench/items', { params }),
+  listItems: (params?: Record<string, unknown>, config?: object) => api.get('/review-workbench/items', { params, ...config }),
 }
 
 export const knowledgePoolApi = {

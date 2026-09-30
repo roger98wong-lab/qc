@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   Card, Select, Button, Table, Tag, Space, Typography, Input, DatePicker, Alert,
@@ -13,6 +13,8 @@ import { reportApi, analysisApi, reviewApi, reviewWorkbenchApi } from '../api'
 import { applyAssignment } from '../applyAssignment'
 import { useAuthStore } from '../store/auth'
 import { ConversationMessageList, conversationFromCandidate, conversationFromIssue } from '../components/Conversation'
+import MultiFilterSelect from '../components/MultiFilterSelect'
+import { parseBatchIds, pickDefaultBatchId, reportBatchQuery, shouldFetchReportBatchData, createRequestGate, workbenchExpectedKey, workbenchItemType, applyWorkbenchListTotal, paginationTotalForTab, type ReportTab } from './reportBatchGate'
 import ReviewProcessingPanel from '../components/ReviewProcessingPanel'
 import DetailModalLayout from '../components/DetailModalLayout'
 
@@ -382,8 +384,8 @@ export default function Report() {
   const user = useAuthStore(s => s.user)
   const isAdmin = user?.role === 'admin'
   const [batches, setBatches] = useState<any[]>([])
-  const [batchId, setBatchId] = useState<number | undefined>()
-  const [filters, setFilters] = useState<Record<string, string>>({})
+  const [batchIds, setBatchIds] = useState<number[]>(() => parseBatchIds(searchParams.get('batch_id')))
+  const [filters, setFilters] = useState<Record<string, string[]>>({})
   const [filterOptions, setFilterOptions] = useState<any>({})
   const [issues, setIssues] = useState<any[]>([])
   const [stats, setStats] = useState<any>({})
@@ -398,14 +400,17 @@ export default function Report() {
   const [kbLoading, setKbLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('issues')
   const [search, setSearch] = useState('')
-  const [priority, setPriority] = useState<string>()
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
-  const [total, setTotal] = useState(0)
+  const [priority, setPriority] = useState<string[]>([])
+  const [issuePage, setIssuePage] = useState(1)
+  const [kbPage, setKbPage] = useState(1)
+  const [issuePageSize, setIssuePageSize] = useState(50)
+  const [kbPageSize, setKbPageSize] = useState(50)
+  const [issueTotal, setIssueTotal] = useState(0)
+  const [kbTotal, setKbTotal] = useState(0)
   const [timeRange, setTimeRange] = useState<any>(null)
-  const [assignmentStatus, setAssignmentStatus] = useState<string>('all')
+  const [assignmentStatus, setAssignmentStatus] = useState<string[]>([])
   const [assignmentScope, setAssignmentScope] = useState<string>('all')
-  const [reviewerId, setReviewerId] = useState<number | undefined>()
+  const [reviewerIds, setReviewerIds] = useState<number[]>([])
   const [decision, setDecision] = useState<string[]>(DEFAULT_KB_DECISIONS)
   const [kbActionableCount, setKbActionableCount] = useState(0)
   const [reviewers, setReviewers] = useState<any[]>([])
@@ -414,8 +419,8 @@ export default function Report() {
   const [assignReviewer, setAssignReviewer] = useState<number>()
 
   useEffect(() => {
-    const requestedBatch = Number(searchParams.get('batch_id'))
-    if (Number.isFinite(requestedBatch) && requestedBatch > 0) setBatchId(requestedBatch)
+    const requestedBatches = parseBatchIds(searchParams.get('batch_id'))
+    if (requestedBatches.length) setBatchIds(requestedBatches)
     const requestedTab = searchParams.get('tab')
     if (requestedTab === 'issues' || requestedTab === 'kb') setActiveTab(requestedTab)
     // 报告页应展示真实创建的全部可查看批次。分析失败/进行中的批次
@@ -423,89 +428,150 @@ export default function Report() {
     analysisApi.listBatches().then(r => {
       const rows = (r.data || []).filter((b: any) => Number(b.processed_count || b.analyzed_slices || b.total_ai_msgs || 0) > 0)
       setBatches(rows)
-      if (!Number.isFinite(requestedBatch) || requestedBatch <= 0) {
-        const available = rows.filter((b: any) => b.status !== 'failed')
-        const fallback = available[0] || rows[0]
-        if (fallback) {
-          setBatchId(fallback.id)
-          setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('batch_id', String(fallback.id)); return next }, { replace: true })
+      if (!requestedBatches.length) {
+        const fallbackId = pickDefaultBatchId(rows)
+        if (fallbackId) {
+          setBatchIds([fallbackId])
+          setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('batch_id', String(fallbackId)); return next }, { replace: true })
         }
       }
     }).catch(() => { setBatches([]); message.error('加载可查看批次失败') })
   }, [searchParams])
 
   useEffect(() => {
-    const defaultScope = 'all'
-    const defaultStatus = 'all'
-    setAssignmentScope(defaultScope)
-    setAssignmentStatus(defaultStatus)
+    setAssignmentScope('all')
+    setAssignmentStatus([])
     if (isAdmin) {
       reviewApi.listReviewers().then(r => setReviewers(r.data || [])).catch(() => setReviewers([]))
     } else {
       setReviewers([])
-      setReviewerId(undefined)
+      setReviewerIds([])
     }
   }, [isAdmin])
 
-  useEffect(() => {
-    if (!batchId) return
-    reportApi.getFilterOptions({ batch_id: batchId }).then(r => setFilterOptions(r.data)).catch(() => setFilterOptions({}))
-    reportApi.getStats({ batch_id: batchId }).then(r => setStats(r.data || {})).catch(() => setStats({}))
-    loadWorkbench()
-  }, [batchId, activeTab, assignmentScope, assignmentStatus])
+  const batchQuery = reportBatchQuery(batchIds)
+  const requestGate = useRef(createRequestGate())
+  const fetchAbort = useRef<AbortController | null>(null)
 
-  useEffect(() => {
-    if (batchId) loadWorkbench()
-  }, [page, pageSize, reviewerId, decision])
+  const ignoreCanceled = (error: any) => error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError' || error?.name === 'AbortError'
 
+  const currentTab = (activeTab === 'kb' ? 'kb' : 'issues') as ReportTab
+  const csv = (values?: Array<string | number>) => values?.length ? values.join(',') : undefined
   const workbenchParams = () => ({
     assignment_scope: isAdmin ? assignmentScope : undefined,
-    assignment_status: assignmentStatus,
-    batch_id: batchId,
-    item_type: activeTab === 'issues' ? 'quality_issue' : 'knowledge_suggestion',
-    assignee_id: isAdmin ? reviewerId : undefined,
-    issue_type: activeTab === 'issues' ? filters.issue_type : undefined,
-    severity: activeTab === 'issues' ? filters.severity : undefined,
-    decision: activeTab === 'kb' ? decision.join(',') : undefined,
-    channel: filters.channel,
-    game: filters.game,
-    region: filters.region,
+    assignment_status: csv(assignmentStatus),
+    batch_ids: batchQuery,
+    item_type: workbenchItemType(currentTab),
+    assignee_ids: isAdmin ? csv(reviewerIds) : undefined,
+    issue_type: currentTab === 'issues' ? csv(filters.issue_type) : undefined,
+    severity: currentTab === 'issues' ? csv(filters.severity) : undefined,
+    priority: currentTab === 'issues' ? csv(priority) : undefined,
+    decision: currentTab === 'kb' ? decision.join(',') : undefined,
+    channel: csv(filters.channel),
+    game: csv(filters.game),
+    region: csv(filters.region),
     search: search.trim() || undefined,
-    page,
-    page_size: pageSize,
+    page: currentTab === 'issues' ? issuePage : kbPage,
+    page_size: currentTab === 'issues' ? issuePageSize : kbPageSize,
   })
 
-  const loadWorkbench = () => {
-    if (!batchId) return
-    setLoading(true)
-    if (activeTab === 'kb') setKbLoading(true)
-    reviewWorkbenchApi.listItems(workbenchParams()).then(r => {
+  const beginFetch = () => {
+    if (!shouldFetchReportBatchData(batchIds) || !batchQuery) return null
+    fetchAbort.current?.abort()
+    const controller = new AbortController()
+    fetchAbort.current = controller
+    return { requestId: requestGate.current.nextId(), signal: controller.signal, controller }
+  }
+
+  const loadWorkbench = (requestId?: number, signal?: AbortSignal) => {
+    if (!shouldFetchReportBatchData(batchIds) || !batchQuery) return
+    const params = workbenchParams()
+    const expectedKey = workbenchExpectedKey({
+      batchQuery: String(params.batch_ids),
+      itemType: String(params.item_type),
+      page: Number(params.page),
+      pageSize: Number(params.page_size),
+    })
+    const id = requestId ?? beginFetch()?.requestId
+    if (id == null) return
+    if (currentTab === 'issues') setLoading(true)
+    else setKbLoading(true)
+    reviewWorkbenchApi.listItems(params, { signal }).then(r => {
+      if (!requestGate.current.shouldApply(id)) return
+      const actualKey = workbenchExpectedKey({
+        batchQuery: String(params.batch_ids),
+        itemType: String(params.item_type),
+        page: Number(params.page),
+        pageSize: Number(params.page_size),
+      })
       const data = r.data || {}
+      const nextTotals = applyWorkbenchListTotal({
+        expectedKey,
+        actualKey,
+        itemType: String(params.item_type),
+        dataTotal: data.total,
+        previous: { issues: issueTotal, kb: kbTotal },
+      })
+      if (!nextTotals) return
       const rows = Array.isArray(data.items) ? data.items : []
-      if (activeTab === 'issues') {
-        const normalizedRows = rows.map(normalizeSliceResult).filter(hasQualityIssue)
-        setIssues(normalizedRows)
-        setTotal(data.total ?? normalizedRows.length)
+      if (params.item_type === 'quality_issue') {
+        setIssues(rows.map(normalizeSliceResult).filter(hasQualityIssue))
+        setIssueTotal(nextTotals.issues)
       } else {
         setKbList(rows)
-        setTotal(data.total ?? rows.length)
+        setKbTotal(nextTotals.kb)
       }
       if (typeof data.kb_actionable_count === 'number') setKbActionableCount(data.kb_actionable_count)
       setSelectedRowKeys([])
     }).catch((e: any) => {
+      if (!requestGate.current.shouldApply(id) || ignoreCanceled(e)) return
       message.error(e?.response?.data?.detail || '加载审核工作台失败')
     }).finally(() => {
+      if (!requestGate.current.shouldApply(id)) return
       setLoading(false)
       setKbLoading(false)
     })
   }
 
+  useEffect(() => {
+    if (!shouldFetchReportBatchData(batchIds) || !batchQuery) {
+      fetchAbort.current?.abort()
+      setIssues([])
+      setKbList([])
+      setStats({})
+      setFilterOptions({})
+      setKbActionableCount(0)
+      setIssueTotal(0)
+      setKbTotal(0)
+      setSelectedRowKeys([])
+      return
+    }
+    const req = beginFetch()
+    if (!req) return
+    reportApi.getFilterOptions({ batch_ids: batchQuery }, { signal: req.signal }).then(r => {
+      if (requestGate.current.shouldApply(req.requestId)) setFilterOptions(r.data)
+    }).catch(error => {
+      if (requestGate.current.shouldApply(req.requestId) && !ignoreCanceled(error)) setFilterOptions({})
+    })
+    reportApi.getStats({ batch_ids: batchQuery }, { signal: req.signal }).then(r => {
+      if (requestGate.current.shouldApply(req.requestId)) setStats(r.data || {})
+    }).catch(error => {
+      if (requestGate.current.shouldApply(req.requestId) && !ignoreCanceled(error)) setStats({})
+    })
+    loadWorkbench(req.requestId, req.signal)
+    return () => { req.controller.abort() }
+  }, [batchQuery, activeTab, assignmentScope, assignmentStatus, issuePage, kbPage, issuePageSize, kbPageSize, reviewerIds, decision, priority])
+
   const loadData = () => {
-    loadWorkbench()
+    const req = beginFetch()
+    if (!req) return
+    loadWorkbench(req.requestId, req.signal)
   }
 
   const loadKb = () => {
-    loadWorkbench()
+    const req = beginFetch()
+    if (!req) return
+    loadWorkbench(req.requestId, req.signal)
   }
 
   const handleDeleteIssue = async (issueId: number) => {
@@ -543,7 +609,7 @@ export default function Report() {
       message.success(`已分派 ${selectedRows.length} 条案例`)
       setAssignOpen(false)
       setSelectedRowKeys([])
-      loadWorkbench()
+      loadData()
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '分派失败')
     }
@@ -555,7 +621,7 @@ export default function Report() {
       const update = applyAssignment(row, result.data)
       if (activeTab === 'issues') setDetail(update); else setKbDetail(update)
       message.success('已认领并锁定该问题')
-      loadWorkbench()
+      loadData()
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '认领失败')
     }
@@ -572,7 +638,7 @@ export default function Report() {
       await reviewApi.release(row.assignment_id)
       message.success('已释放处理锁')
       if (activeTab === 'issues') setDetail(null); else setKbDetail(null)
-      loadWorkbench()
+      loadData()
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '释放失败')
     }
@@ -584,7 +650,7 @@ export default function Report() {
       await reviewApi.forceRelease(row.assignment_id)
       message.success('已强制释放处理锁')
       if (activeTab === 'issues') setDetail(null); else setKbDetail(null)
-      loadWorkbench()
+      loadData()
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '强制释放失败')
     }
@@ -593,7 +659,8 @@ export default function Report() {
   const generateReport = async () => {
     setGenLoading(true)
     try {
-      const res = await reportApi.generateReport({ batch_id: batchId, ...filters })
+      if (batchIds.length !== 1) { message.warning('生成 HTML 报告请只选一个批次'); return }
+      const res = await reportApi.generateReport({ batch_id: batchIds[0], ...filters })
       const id = res.data.report_id
       message.success('报告已生成')
       const html = await reportApi.fetchReportHtml(id)
@@ -611,7 +678,7 @@ export default function Report() {
     setDetail(row)
     setDetailConversationOpen(false)
     setDetailFocusedMessageId(null)
-    setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('tab', 'issues'); if (batchId) next.set('batch_id', String(batchId)); return next }, { replace: true })
+    setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('tab', 'issues'); if (batchIds.length) next.set('batch_id', batchIds.join(',')); return next }, { replace: true })
     requestAnimationFrame(() => {
       document.querySelector<HTMLElement>('.qc-issue-detail-modal .qc-detail-modal-body')?.scrollTo({ top: 0 })
     })
@@ -656,6 +723,7 @@ export default function Report() {
     { title: '地区', dataIndex: 'region', width: 90, render: (v: string) => displayValue(v) },
     { title: '置信度', dataIndex: 'confidence', width: 92, render: (value: number) => typeof value === 'number' ? `${Math.round(value * 100)}%` : '—' },
     { title: '切片ID', dataIndex: 'slice_id', width: 160, ellipsis: true, render: (value: string, row: any) => displayValue(value || row.session_uid) },
+    { title: '批次', dataIndex: 'batch_id', width: 140, ellipsis: true, render: (value: number) => displayValue(batches.find(item => item.id === value)?.name, String(value ?? '')) },
     { title: '审核状态', dataIndex: 'assignment_status', width: 100, render: (v: string) => <Tag color={v === 'completed' ? 'success' : v === 'in_progress' ? 'processing' : v === 'returned' ? 'warning' : v === 'unassigned' ? 'default' : 'blue'}>{assignmentStatusLabel(v)}</Tag> },
     { title: '审核员', dataIndex: 'assignee', width: 100, render: (v: string) => displayValue(v) },
     { title: '最后修改时间', dataIndex: 'last_modified_at', width: 168, ellipsis: true, render: (value: string) => <Tooltip title={displayValue(value)}><span style={{ whiteSpace: 'nowrap' }}>{formatDisplayTime(value)}</span></Tooltip> },
@@ -726,7 +794,7 @@ export default function Report() {
     {
       title: '操作', width: 80, fixed: 'right' as const,
       render: (_: any, row: any) => (
-        <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => { setKbDetail(row); setKbConversationOpen(false); setKbFocusedMessageId(null); setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('tab', 'kb'); if (batchId) next.set('batch_id', String(batchId)); return next }, { replace: true }) }}>详情</Button>
+        <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => { setKbDetail(row); setKbConversationOpen(false); setKbFocusedMessageId(null); setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('tab', 'kb'); if (batchIds.length) next.set('batch_id', batchIds.join(',')); return next }, { replace: true }) }}>详情</Button>
       ),
     },
   ]
@@ -750,7 +818,7 @@ export default function Report() {
             rowSelection={isAdmin ? { selectedRowKeys, onChange: setSelectedRowKeys } : undefined}
             loading={loading} scroll={{ x: 900 }}
             sortDirections={['ascend', 'descend']}
-            pagination={{ current: page, pageSize, total, showSizeChanger: true, pageSizeOptions: ['20','50','100','200','500'], showTotal: n => `共 ${n} 条`, onChange: (p, ps) => { setPage(p); if (ps !== pageSize) { setPageSize(ps); setPage(1) } } }}
+            pagination={{ current: issuePage, pageSize: issuePageSize, total: issueTotal, showSizeChanger: true, pageSizeOptions: ['20','50','100','200','500'], showTotal: n => `共 ${n} 条`, onChange: (p, ps) => { if (ps !== issuePageSize) { setIssuePageSize(ps); setIssuePage(1) } else setIssuePage(p) } }}
             size="small"
           />
         </Card>
@@ -774,7 +842,7 @@ export default function Report() {
             rowKey="id" dataSource={kbList} columns={kbColumns}
             rowSelection={isAdmin ? { selectedRowKeys, onChange: setSelectedRowKeys, getCheckboxProps: (row: any) => ({ disabled: !POOL_KB_DECISIONS.includes(row.decision) }) } : undefined}
             loading={kbLoading} scroll={{ x: 1580 }}
-            pagination={{ current: page, pageSize, total, showSizeChanger: true, pageSizeOptions: ['20','50','100','200','500'], showTotal: n => `共 ${n} 条`, onChange: (p, ps) => { setPage(p); if (ps !== pageSize) { setPageSize(ps); setPage(1) } } }}
+            pagination={{ current: kbPage, pageSize: kbPageSize, total: kbTotal, showSizeChanger: true, pageSizeOptions: ['20','50','100','200','500'], showTotal: n => `共 ${n} 条`, onChange: (p, ps) => { if (ps !== kbPageSize) { setKbPageSize(ps); setKbPage(1) } else setKbPage(p) } }}
             size="small"
             rowClassName={() => 'kb-row'}
           />
@@ -830,50 +898,50 @@ export default function Report() {
       `}</style>
       <Card className="qc-filter-card" style={{ marginBottom: 14 }} bodyStyle={{ padding: 18 }}>
         <div className="qc-filter-header">
-          <Text type="secondary">{batchId ? `当前批次：${displayValue(batches.find(b => b.id === batchId)?.name)}` : '尚未选择批次'}</Text>
+          <Text type="secondary">{batchIds.length ? `当前批次：${batchIds.map(id => displayValue(batches.find(b => b.id === id)?.name, String(id))).join('、')}` : '请选择批次'}</Text>
         </div>
         <Space className="qc-filter-controls" wrap size={[8, 10]}>
           <RangePicker value={timeRange} onChange={setTimeRange} placeholder={['开始日期', '结束日期']} />
-          <Select placeholder="选择分析批次" style={{ width: 240 }} value={batchId} onChange={v => { setBatchId(v); setFilters({}); setPage(1); setSelectedRowKeys([]); setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('batch_id', String(v)); return next }, { replace: true }) }}
+          <MultiFilterSelect placeholder="选择分析批次" style={{ minWidth: 240 }} value={batchIds} onChange={v => { setBatchIds(v); setFilters({}); setIssuePage(1); setKbPage(1); setSelectedRowKeys([]); setSearchParams(prev => { const next = new URLSearchParams(prev); if (v?.length) next.set('batch_id', v.join(',')); else next.delete('batch_id'); return next }, { replace: true }) }}
             options={batches.map(b => ({ value: b.id, label: b.name }))} />
-          <Select placeholder="选择严重程度" style={{ width: 120 }} allowClear
+          <MultiFilterSelect placeholder="选择严重程度" style={{ minWidth: 140 }}
             value={filters.severity} onChange={v => setFilters(f => ({ ...f, severity: v }))}
-            options={(filterOptions.severities || []).map((v: string) => ({ value: v, label: v }))} />
-          <Select placeholder="选择问题类型" style={{ width: 180 }} allowClear
+            options={(filterOptions.severities || []).map((item: string) => ({ value: item, label: item }))} />
+          <MultiFilterSelect placeholder="选择问题类型" style={{ minWidth: 180 }}
             value={filters.issue_type} onChange={v => setFilters(f => ({ ...f, issue_type: v }))}
-            options={Array.from(new Set([...(filterOptions.issue_types || []), ...ISSUE_CATEGORIES])).map((v: string) => ({ value: v, label: v }))} />
-          <Select placeholder="选择渠道" style={{ width: 100 }} allowClear
+            options={Array.from(new Set([...(filterOptions.issue_types || []), ...ISSUE_CATEGORIES])).map((item: string) => ({ value: item, label: item }))} />
+          <MultiFilterSelect placeholder="选择渠道" style={{ minWidth: 120 }}
             value={filters.channel} onChange={v => setFilters(f => ({ ...f, channel: v }))}
-            options={(filterOptions.channels || []).map((v: string) => ({ value: v, label: v }))} />
-          <Select placeholder="选择游戏" style={{ width: 150 }} allowClear
+            options={(filterOptions.channels || []).map((item: string) => ({ value: item, label: item }))} />
+          <MultiFilterSelect placeholder="选择游戏" style={{ minWidth: 150 }}
             value={filters.game} onChange={v => setFilters(f => ({ ...f, game: v }))}
-            options={(filterOptions.games || []).map((v: string) => ({ value: v, label: v }))} />
-          <Select placeholder="选择地区" style={{ width: 130 }} allowClear
+            options={(filterOptions.games || []).map((item: string) => ({ value: item, label: item }))} />
+          <MultiFilterSelect placeholder="选择地区" style={{ minWidth: 130 }}
             value={filters.region} onChange={v => setFilters(f => ({ ...f, region: v }))}
-            options={(filterOptions.regions || []).map((v: string) => ({ value: v, label: v }))} />
-          <Select
-            placeholder="选择审核状态" style={{ width: 130 }}
+            options={(filterOptions.regions || []).map((item: string) => ({ value: item, label: item }))} />
+          <MultiFilterSelect
+            placeholder="选择审核状态" style={{ minWidth: 150 }}
             value={assignmentStatus}
-            onChange={v => { setAssignmentStatus(v); setPage(1) }}
-            options={ASSIGNMENT_STATUS_OPTIONS}
+            onChange={v => { setAssignmentStatus(v); setIssuePage(1); setKbPage(1) }}
+            options={ASSIGNMENT_STATUS_OPTIONS.filter(option => option.value !== 'all')}
           />
-          {isAdmin && <Select
-            placeholder="选择审核员" style={{ width: 130 }} allowClear showSearch
-            value={reviewerId} onChange={v => { setReviewerId(v); setPage(1) }}
+          {isAdmin && <MultiFilterSelect
+            placeholder="选择审核员" style={{ minWidth: 150 }} showSearch
+            value={reviewerIds} onChange={v => { setReviewerIds(v); setIssuePage(1); setKbPage(1) }}
             options={reviewers.map((reviewer: any) => ({ value: reviewer.id, label: reviewer.username }))}
           />}
           {activeTab === 'kb' && <Select
             placeholder="知识建议状态" style={{ minWidth: 220 }} allowClear mode="multiple"
             maxTagCount="responsive"
             value={decision}
-            onChange={v => { setDecision(v?.length ? v : DEFAULT_KB_DECISIONS); setPage(1) }}
+            onChange={v => { setDecision(v?.length ? v : DEFAULT_KB_DECISIONS); setKbPage(1) }}
             options={KB_DECISION_OPTIONS}
           />}
-          <Select placeholder="选择优先级" style={{ width: 100 }} allowClear value={priority} onChange={v => setPriority(v)} options={['P0','P1','P2','P3'].map(v => ({value:v,label:v}))} />
+          <MultiFilterSelect placeholder="选择优先级" style={{ minWidth: 120 }} value={priority} onChange={v => { setPriority(v); setIssuePage(1) }} options={['P0','P1','P2','P3'].map(item => ({value:item,label:item}))} />
           <Input.Search value={search} onChange={e => setSearch(e.target.value)} onSearch={loadData} placeholder="搜索切片ID、会话、产品或对话内容" style={{width:240}} allowClear />
           <Button icon={<FilterOutlined />} type="primary" onClick={loadData} loading={loading}>查询</Button>
-          <Button onClick={() => { setFilters({}); setPriority(undefined); setReviewerId(undefined); setDecision(DEFAULT_KB_DECISIONS); setSearch(''); setTimeRange(null); setAssignmentStatus('all'); setPage(1) }}>重置</Button>
-          {isAdmin && <Button onClick={() => reportApi.exportExcel({ batch_id: batchId, ...filters })} icon={<DownloadOutlined />}>
+          <Button onClick={() => { setFilters({}); setPriority([]); setReviewerIds([]); setDecision(DEFAULT_KB_DECISIONS); setSearch(''); setTimeRange(null); setAssignmentStatus([]); setIssuePage(1); setKbPage(1) }}>重置</Button>
+          {isAdmin && <Button onClick={() => reportApi.exportExcel({ batch_ids: batchQuery, severity: csv(filters.severity), channel: csv(filters.channel), game: csv(filters.game), region: csv(filters.region) })} icon={<DownloadOutlined />}>
             导出Excel
           </Button>}
           {isAdmin && <Button type="default" onClick={generateReport} loading={genLoading}>
@@ -885,7 +953,7 @@ export default function Report() {
         </Space>
       </Card>
 
-      {!batchId && <Alert type="info" showIcon message="还没有可看的分析批次" description="先完成一次上传分析，或联系管理员检查批次状态。" style={{ marginBottom: 14 }} />}
+      {!batches.length && <Alert type="info" showIcon message="还没有可看的分析批次" description="先完成一次上传分析，或联系管理员检查批次状态。" style={{ marginBottom: 14 }} />}
 
       <Row gutter={12} style={{ marginBottom: 16 }}>
         {[
@@ -904,7 +972,7 @@ export default function Report() {
         ))}
       </Row>
 
-      <Tabs activeKey={activeTab} onChange={key => { setActiveTab(key); setPage(1); setSelectedRowKeys([]); setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('tab', key); return next }, { replace: true }) }} items={tabItems} />
+      <Tabs activeKey={activeTab} onChange={key => { setActiveTab(key); setSelectedRowKeys([]); setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('tab', key); if (batchIds.length) next.set('batch_id', batchIds.join(',')); return next }, { replace: true }) }} items={tabItems} />
 
       <DetailModalLayout
         open={!!detail}

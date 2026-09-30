@@ -8,8 +8,8 @@ sys.path.insert(0, str(ROOT / "backend"))
 os.chdir(ROOT / "backend")
 
 from services.excel_parser import (
-    _filter_standard_messages, _message_speaker, _parse_standard,
-    clean_standard_message_body, extract_human_kb_suggestions, parse_standard_dialogue,
+    _cell_text, _filter_standard_messages, _message_speaker, _parse_standard,
+    clean_standard_message_body, extract_human_kb_suggestions, is_broadcast_kefu_message, parse_standard_dialogue,
 )
 
 
@@ -29,6 +29,33 @@ class StandardSliceFilterTest(unittest.TestCase):
     def test_blank_or_unparsed_is_dropped(self):
         sessions, _, _ = _parse_standard(_frame("", "   "), "DC")
         self.assertEqual(sessions, [])
+
+    def test_empty_kefu_column_is_not_sent_to_maas(self):
+        dialogue = _line("客服", "LUNAR MECHA PALACE — ADVANCE EXPLORATION REPORT")
+        df = pd.DataFrame({"客服": [None, ""], "对话记录": [dialogue, dialogue]})
+        sessions, suggestions, error = _parse_standard(df, "DC")
+        self.assertIsNone(error)
+        self.assertEqual(sessions, [])
+        self.assertEqual(suggestions, [])
+
+    def test_empty_reply_person_column_is_not_sent_to_maas(self):
+        dialogue = _line("客服", "活动公告")
+        df = pd.DataFrame({"回复人": [float("nan")], "对话记录": [dialogue]})
+        sessions, _, _ = _parse_standard(df, "DC")
+        self.assertEqual(sessions, [])
+
+    def test_named_kefu_column_still_ingests_dialogue(self):
+        dialogue = "\n".join([_line("用户", "怎么玩"), _line("客服-张三", "我来帮你")])
+        df = pd.DataFrame({"客服": ["客服-张三"], "对话记录": [dialogue]})
+        sessions, _, _ = _parse_standard(df, "DC")
+        self.assertEqual(len(sessions), 1)
+        speakers = [item["speaker"] for item in sessions[0]["slice_payload"]["messages"]]
+        self.assertEqual(speakers, ["player", "human_agent"])
+
+    def test_missing_kefu_header_still_parses_from_dialogue(self):
+        dialogue = "\n".join([_line("用户", "怎么玩"), _line("客服-张三", "我来帮你")])
+        sessions, _, _ = _parse_standard(_frame(dialogue), "DC")
+        self.assertEqual(len(sessions), 1)
 
     def test_system_only_is_dropped(self):
         sessions, _, _ = _parse_standard(_frame(_line("system", "内部提示")), "VK")
@@ -98,6 +125,46 @@ class StandardSliceFilterTest(unittest.TestCase):
         self.assertEqual(_message_speaker({"role": "客服 - command"}), "system")
         self.assertEqual(_message_speaker({"role": "客服-谢艺"}), "human_agent")
 
+    def test_system_identity_role_is_system_not_human_agent(self):
+        self.assertEqual(_message_speaker({"role": "system"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-system"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服 - system"}), "system")
+        self.assertEqual(_message_speaker({"role": "系统"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-张三"}), "human_agent")
+
+    def test_push_and_server_roles_are_system_not_human_agent(self):
+        self.assertEqual(_message_speaker({"role": "客服-uce_push"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-客服-uce_push"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-external_push"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-客服-external_push"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-客服-server"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-server"}), "system")
+        self.assertEqual(_message_speaker({"role": "客服-张三"}), "human_agent")
+
+    def test_player_and_external_push_only_is_dropped(self):
+        dialogue = "\n".join([_line("用户", "hello"), _line("客服-客服-external_push", "活动推送")])
+        sessions, suggestions, _ = _parse_standard(_frame(dialogue), "VK")
+        self.assertEqual(sessions, [])
+        self.assertEqual(suggestions, [])
+
+    def test_player_and_kefu_system_only_is_dropped(self):
+        dialogue = "\n".join([_line("用户", "BIND_VIP_LDAZ0KMPAM"), _line("客服-system", "恭喜您認證成功")])
+        sessions, suggestions, _ = _parse_standard(_frame(dialogue), "FB")
+        self.assertEqual(sessions, [])
+        self.assertEqual(suggestions, [])
+
+    def test_kefu_system_dropped_but_real_agent_kept(self):
+        dialogue = "\n".join([
+            _line("用户", "怎么领"),
+            _line("客服-system", "系统通知"),
+            _line("客服-张三", "打开活动领取"),
+        ])
+        sessions, _, _ = _parse_standard(_frame(dialogue), "FB")
+        self.assertEqual(len(sessions), 1)
+        speakers = [item["speaker"] for item in sessions[0]["slice_payload"]["messages"]]
+        self.assertEqual(speakers, ["player", "human_agent"])
+        self.assertEqual(sessions[0]["slice_payload"]["messages"][1]["speaker_source"], "客服-张三")
+
     def test_player_and_uce_push_only_is_dropped(self):
         dialogue = "\n".join([_line("用户", "你好"), _line("客服-uce_push", "活动推送")])
         sessions, suggestions, _ = _parse_standard(_frame(dialogue), "DC")
@@ -130,6 +197,37 @@ class StandardSliceFilterTest(unittest.TestCase):
         self.assertEqual(extract_human_kb_suggestions(msgs, "冒险大作战", "欧美", "DC"), [])
 
 
+    def test_bare_kefu_announcement_is_dropped(self):
+        dialogue = _line("客服", "Lunar Mecha Palace\nDear Commander, event rewards are now live.\nVisit https://example.com/topup")
+        sessions, _, _ = _parse_standard(_frame(dialogue), "DC")
+        self.assertEqual(sessions, [])
+
+    def test_bare_kefu_announcement_dropped_named_agent_kept(self):
+        dialogue = "\n".join([
+            _line("用户", "充值不到账"),
+            _line("客服", "Lunar Mecha Palace\nDear Commander, event rewards are now live."),
+            _line("客服-张三", "我帮你排查，请提供订单号"),
+        ])
+        sessions, _, _ = _parse_standard(_frame(dialogue), "FB")
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual([m["speaker"] for m in sessions[0]["slice_payload"]["messages"]], ["player", "human_agent"])
+
+    def test_bare_kefu_short_reply_is_human(self):
+        message = {"role": "客服", "content": "Bonjour, nous sommes désolés, je vérifie votre problème."}
+        self.assertFalse(is_broadcast_kefu_message(message["role"], message["content"]))
+        self.assertEqual(_message_speaker(message), "human_agent")
+        dialogue = "\n".join([_line("用户", "订单有问题"), _line("客服", message["content"])])
+        sessions, _, _ = _parse_standard(_frame(dialogue), "FB")
+        self.assertEqual(len(sessions), 1)
+
+    def test_identifier_values_do_not_use_scientific_notation(self):
+        self.assertEqual(_cell_text(39801497322782938, identifier=True), "39801497322782938")
+        self.assertEqual(_cell_text("3.9801497322782936e+16", identifier=True), "39801497322782936")
+        self.assertEqual(_cell_text(float("3.9801497322782936e+16"), identifier=True), "39801497322782936")
+        dialogue = "\n".join([_line("用户", "hello"), _line("客服-张三", "done")])
+        df = pd.DataFrame({"用户id（三方渠道的）": ["3.9801497322782936e+16"], "对话记录": [dialogue]})
+        sessions, _, _ = _parse_standard(df, "FB")
+        self.assertEqual(sessions[0]["session_uid"], "39801497322782936")
 REPLY_JSON = (
     '{"reference":{"author_name":"haiso","attachments":[],"message_id":"1548354389465374872",'
     '"has_attachment":0,"channel_id":"1517407543289188403","content":"Animalparty","timestamp":1789226853},'

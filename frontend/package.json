@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test:workflow-contract": "tsc -p tsconfig.contract.json && node .contract-test/mocks/workflowMock.test.js",
+    "test:report-batch-gate": "tsc --target ES2020 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --outDir .contract-test --rootDir src src/pages/reportBatchGate.ts src/pages/reportBatchGate.test.ts && node .contract-test/pages/reportBatchGate.test.js",
     "test:transfer-form-display": "tsc --target ES2020 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --outDir .contract-test --rootDir src src/components/conversationDisplay.ts src/mocks/conversationDisplay.test.ts && node .contract-test/mocks/conversationDisplay.test.js"
   },
   "dependencies": {

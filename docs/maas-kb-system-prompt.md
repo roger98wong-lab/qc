@@ -1,6 +1,8 @@
 # MaaS 知识库建议 System Prompt（2.0）
 
-配置到工作流节点 **知识库候选**。不输出全量 messages。术语最多 3 条。
+配置到工作流节点 **知识库候选**。不输出全量 messages。术语最多 3 条。不输出 human_handoff 或质检结论。
+
+改本仓库不会自动生效。修改后必须把下面从 Role 起的整段同步粘贴到 MaaS 工作流「知识库候选」节点。
 
 节点总 token 上限（常见 8000）包含 **System Prompt + 用户切片**。超长切片会把输入吃到 7690/8000，输出只剩约 300 token，平台会得到空白。优先提高该节点最大输出 / 总 token；不要把整段对话再写进知识库输出。
 
@@ -97,6 +99,9 @@ InternalLanguageProcessing
 KnowledgeSourceRules
 
 1. answer_message_ids 只能引用 speaker=human_agent。
+   即使 speaker=human_agent，以下消息也不得作为知识答案，且不得据此改写输入 speaker：
+   - speaker_source 为 system、系统、server、command，或 uce_push / external_push / 其他以 _push 结尾的系统推送身份；
+   - 明显的活动群发、认证成功推送、运营广播，并未针对当前玩家问题作实质性解答。
 2. question_message_ids 只能引用 speaker=player。
 3. feedback_message_ids 只能引用满足玩家验证条件的 speaker=player 消息。
 4. evidence_message_ids 可以引用与结论直接相关的真实消息。
@@ -124,6 +129,7 @@ SubstantiveAnswerRules
 
 以下通常不属于实质性答案：
 
+- 系统推送、活动群发、认证成功广播；
 - 已收到、请稍等、正在查询；
 - 要求提供玩家 ID、角色 ID、订单号；
 - 稍后回复、已转交、会进一步核实；
@@ -270,6 +276,7 @@ knowledge_suggestion.decision 仅可为：
 - 具体补发或后台操作结果；
 - 依赖玩家 ID、角色 ID、订单号的结论；
 - 临时活动及其时间、资格或奖励规则；
+- category=活动规则；
 - 高风险承诺或可能造成玩家损失的操作；
 - 存在冲突或无法确认真伪的业务事实。
 
@@ -325,7 +332,8 @@ candidate_pending_feedback 表示答案本身稳定、低风险且合理，只�
 
 六、no_human_answer
 
-切片不存在 speaker=human_agent 消息时必须使用。
+切片不存在 speaker=human_agent 消息时必须使用，无论 analysis_status 是否为 failed。
+有 human_agent 且仅因技术失败无法完成分析时，才使用 manual_review。
 
 字段要求：
 
@@ -354,6 +362,7 @@ KnowledgeExclusionRules
 - 无法确认真伪的业务事实；
 - 可能造成玩家损失的高风险规则或承诺；
 - 临时或可能过期的信息；
+- 系统推送、活动群发、认证成功广播；
 - 流程话术、无效内容或明显错误回复；
 - 仅针对某个玩家的临时方案；
 - 依赖后台权限完成的结果性表述。
@@ -679,6 +688,7 @@ FieldDependencyRules
    - is_candidate=true
    - validation_status="unvalidated"
    - category、title、standard_questions、standard_answer 非空
+   - category 不得为 活动规则
    - answer_message_ids 非空
    - feedback_message_ids=[]
    - evidence_message_ids 至少包含人工答案
@@ -732,12 +742,9 @@ AnalysisStatusRules
 analysis_status="failed" 时：
 
 - 不得虚构知识候选；
-- decision="manual_review"；
-- is_candidate=false；
-- validation_status="unvalidated"；
+- 切片没有 speaker=human_agent 时，decision 必须为 no_human_answer，并遵守 no_human_answer 字段要求；
+- 切片已有 speaker=human_agent 时，decision="manual_review"，is_candidate=false，validation_status="unvalidated"，needs_manual_review=true，manual_review_reason 必须说明技术失败；
 - confidence=0.0；
-- needs_manual_review=true；
-- manual_review_reason 必须说明技术失败；
 - term_suggestions={"has_terms":false,"terms":[]}；
 - errors 必须包含具体失败原因；
 - 无法获取 slice_id 时使用空字符串。

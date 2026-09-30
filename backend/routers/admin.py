@@ -12,11 +12,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from datetime import datetime
 import io
 from fastapi.responses import Response
-from sqlalchemy import case, or_, text, update
+from sqlalchemy import case, func, or_, text, update
 from database import (get_db, User, MappingConfig, GameAiConfig, QcSlice, AnalysisBatch,
                       QcSliceQualityIssue, QcSliceKnowledgeSuggestion, Session, utcnow,
                       AuditLog, QcIssue, KbSuggestion)
 from services.game_ai_config import serialize_config as serialize_game_ai_config
+from services.handoff_stats import HANDOFF_TOP_SCOPES, aggregate_handoff_top, parse_human_handoff
+from query_filters import csv_ints, csv_texts
 from sqlalchemy.exc import IntegrityError
 from auth import require_admin
 from config import BACKUP_DIR, DB_PATH
@@ -310,6 +312,100 @@ def audit_slice_detail(slice_id: int, admin: User = Depends(require_admin), db=D
     issues = db.query(QcSliceQualityIssue).filter(QcSliceQualityIssue.slice_id == row.id).order_by(QcSliceQualityIssue.confidence.desc()).all()
     knowledge = db.query(QcSliceKnowledgeSuggestion).filter(QcSliceKnowledgeSuggestion.slice_id == row.id).first()
     return _admin_slice_dict(row, session, issues, knowledge)
+
+
+def _handoff_slice_record(row):
+    handoff = parse_human_handoff(row.human_handoff_json)
+    analyzed_at = row.completed_at or row.created_at
+    return {
+        "id": row.id,
+        "slice_id": row.slice_id,
+        "batch_id": row.batch_id,
+        "batch_name": row.batch_name or row.batch_id,
+        "channel": row.channel,
+        "game": row.game,
+        "region": row.region,
+        "analysis_status": row.analysis_status,
+        "completed_at": analyzed_at.isoformat() if analyzed_at else None,
+        "human_handoff": {
+            "decision": handoff.get("decision"),
+            "handoff_occurred": handoff.get("handoff_occurred"),
+            "reason_type": handoff.get("reason_type"),
+            "reason": handoff.get("reason") or "",
+            "confidence": handoff.get("confidence"),
+        } if isinstance(handoff, dict) else None,
+    }
+
+
+@router.get("/audit/handoff-top", summary="转人工类型 TOP")
+def audit_handoff_top(
+    start: datetime | None = None, end: datetime | None = None,
+    batch_id: int | None = None, batch_ids: str | None = None, analysis_status: str | None = None,
+    channel: str | None = None, game: str | None = None, region: str | None = None,
+    scope: str = Query("occurred"), reason_type: str | None = None,
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    admin: User = Depends(require_admin), db=Depends(get_db),
+):
+    if scope not in HANDOFF_TOP_SCOPES:
+        raise HTTPException(400, "scope 仅支持 occurred、required、unreasonable")
+    analyzed_at = func.coalesce(QcSlice.completed_at, QcSlice.created_at)
+    q = db.query(
+        QcSlice.id, QcSlice.slice_id, QcSlice.batch_id, QcSlice.channel,
+        QcSlice.game, QcSlice.region, QcSlice.analysis_status,
+        QcSlice.completed_at, QcSlice.created_at, QcSlice.human_handoff_json,
+        AnalysisBatch.name.label("batch_name"),
+    ).outerjoin(AnalysisBatch, QcSlice.batch_id == AnalysisBatch.id)
+    q = q.filter(QcSlice.analysis_status.in_(("completed", "partial")))
+    q = q.filter(QcSlice.human_handoff_json.isnot(None), QcSlice.human_handoff_json != "")
+    if start:
+        q = q.filter(analyzed_at >= start)
+    if end:
+        q = q.filter(analyzed_at <= end)
+    rows = q.order_by(analyzed_at.desc(), QcSlice.id.desc()).all()
+    records = []
+    games, channels, regions, batches = set(), set(), set(), {}
+    for row in rows:
+        record = _handoff_slice_record(row)
+        if not record["human_handoff"]:
+            continue
+        records.append(record)
+        if row.game:
+            games.add(row.game)
+        if row.channel:
+            channels.add(row.channel)
+        if row.region:
+            regions.add(row.region)
+        if row.batch_id:
+            batches[row.batch_id] = record["batch_name"]
+
+    selected_batches = csv_ints(batch_ids, batch_id)
+    selected_channels = csv_texts(channel)
+    selected_games = csv_texts(game)
+    selected_regions = csv_texts(region)
+
+    filtered = [
+        row for row in records
+        if (not selected_channels or row.get("channel") in selected_channels)
+        and (not selected_games or row.get("game") in selected_games)
+        and (not selected_regions or row.get("region") in selected_regions)
+        and (not selected_batches or row.get("batch_id") in selected_batches)
+        and (not analysis_status or row.get("analysis_status") == analysis_status)
+    ]
+    result = aggregate_handoff_top(
+        filtered, scope=scope, reason_type=reason_type, page=page, page_size=page_size,
+    )
+    result["filters"] = {
+        "games": sorted(games),
+        "channels": sorted(channels),
+        "regions": sorted(regions),
+        "batches": [{"id": key, "name": batches[key]} for key in sorted(batches)],
+        "scopes": [
+            {"value": "occurred", "label": "已转人工"},
+            {"value": "required", "label": "应转未转"},
+            {"value": "unreasonable", "label": "不合理转人工"},
+        ],
+    }
+    return result
 
 
 def _env_path() -> str:

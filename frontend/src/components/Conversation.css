@@ -11,6 +11,7 @@
 .qc-conversation-meta .ant-typography { font-size: 11px; }
 .qc-conversation-identity { display: inline-flex; align-items: center; min-width: 0; gap: 5px; }
 .qc-human-agent-name { color: #166534; font-weight: 600; }
+.qc-ai-name { color: #1d4ed8; font-weight: 600; }
 .qc-role-tag { margin: 0; font-weight: 600; }
 .qc-event-tag { margin: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-color: #fde68a; background: #fffbeb; color: #92400e; }
 .qc-form-fields { display: grid; gap: 6px; min-width: 0; margin: 0; }
