@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import or_
+from query_filters import csv_ints, csv_texts
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -294,10 +296,10 @@ def _matches(assignment, user, scope, status):
     return _matches_status(assignment, status)
 
 
-def _matches_status(assignment, status):
+def _matches_one_status(assignment, status):
+    expected = _status(assignment)
     if status in (None, "all"):
         return True
-    expected = _status(assignment)
     if status == "unassigned":
         return expected == "unassigned"
     if status == "uncompleted":
@@ -305,6 +307,13 @@ def _matches_status(assignment, status):
     if status == "assigned":
         return expected in {"assigned", "pending"}
     return expected == status
+
+
+def _matches_status(assignment, status):
+    statuses = csv_texts(status)
+    if not statuses or "all" in statuses:
+        return True
+    return any(_matches_one_status(assignment, item) for item in statuses)
 
 
 def _assignment_fields(db: Session, assignment):
@@ -322,10 +331,13 @@ def list_items(
     scope: Optional[str] = Query(None, alias="assignment_scope"),
     status: Optional[str] = Query(None, alias="assignment_status"),
     batch_id: Optional[int] = Query(None),
+    batch_ids: Optional[str] = Query(None),
     item_type: Optional[str] = Query(None),
     assignee_id: Optional[int] = Query(None),
+    assignee_ids: Optional[str] = Query(None),
     issue_type: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
     decision: Optional[List[str]] = Query(None),
     channel: Optional[str] = Query(None),
     game: Optional[str] = Query(None),
@@ -340,6 +352,14 @@ def list_items(
         scope = None
     if scope not in {None, "all", "mine", "unassigned"}:
         raise HTTPException(400, "assignment_scope 参数无效")
+    selected_batches = csv_ints(batch_ids, batch_id)
+    selected_assignees = csv_ints(assignee_ids, assignee_id)
+    selected_issue_types = csv_texts(issue_type)
+    selected_severities = csv_texts(severity)
+    selected_channels = csv_texts(channel)
+    selected_games = csv_texts(game)
+    selected_regions = csv_texts(region)
+    selected_priorities = csv_texts(priority)
     issue_assignments = _assignment_map(db, "quality_issue")
     kb_assignments = _assignment_map(db, "knowledge_suggestion")
     items = []
@@ -355,25 +375,33 @@ def list_items(
             QcSliceQualityIssue.is_primary.is_(True),
             QcSlice.analysis_status.in_(["completed", "partial"]),
         )
-        if batch_id:
-            query = query.filter(QcSlice.batch_id == batch_id)
+        if selected_batches:
+            query = query.filter(QcSlice.batch_id.in_(selected_batches))
         if search and search.strip():
             query = query.filter(QcSlice.slice_id.contains(search.strip()))
-        if issue_type:
-            query = query.filter(QcSliceQualityIssue.issue_type.contains(issue_type))
-        if severity:
-            query = query.filter(QcSliceQualityIssue.severity == severity)
-        if channel:
-            query = query.filter(QcSlice.channel == channel)
-        if game:
-            query = query.filter(QcSlice.game.contains(game))
-        if region:
-            query = query.filter(QcSlice.region.contains(region))
+        if selected_issue_types:
+            query = query.filter(or_(
+                QcSliceQualityIssue.issue_type.in_(selected_issue_types),
+                QcSliceQualityIssue.human_issue_type.in_(selected_issue_types),
+            ))
+        if selected_severities:
+            query = query.filter(or_(
+                QcSliceQualityIssue.severity.in_(selected_severities),
+                QcSliceQualityIssue.human_severity.in_(selected_severities),
+            ))
+        if selected_channels:
+            query = query.filter(QcSlice.channel.in_(selected_channels))
+        if selected_games:
+            query = query.filter(QcSlice.game.in_(selected_games))
+        if selected_regions:
+            query = query.filter(QcSlice.region.in_(selected_regions))
         for issue, slice_row, conversation in query.order_by(QcSliceQualityIssue.created_at.desc()).all():
             assignment = issue_assignments.get(issue.id)
-            if user.role == "admin" and assignee_id and (not assignment or assignment.assignee_id != assignee_id):
+            if user.role == "admin" and selected_assignees and (not assignment or assignment.assignee_id not in selected_assignees):
                 continue
             if not _matches(assignment, user, scope, status):
+                continue
+            if selected_priorities and _issue_priority(issue.human_severity or issue.severity) not in selected_priorities:
                 continue
             related = db.query(QcSliceQualityIssue).filter(
                 QcSliceQualityIssue.slice_id == slice_row.id
@@ -436,20 +464,20 @@ def list_items(
         QcSliceKnowledgeSuggestion.decision.in_(KNOWLEDGE_DECISIONS | {"reject"}),
         QcSlice.analysis_status.in_(["completed", "partial"]),
     )
-    if batch_id:
-        query = query.filter(QcSlice.batch_id == batch_id)
+    if selected_batches:
+        query = query.filter(QcSlice.batch_id.in_(selected_batches))
     if search and search.strip():
         query = query.filter(QcSlice.slice_id.contains(search.strip()))
-    if channel:
-        query = query.filter(QcSlice.channel == channel)
-    if game:
-        query = query.filter(QcSlice.game.contains(game))
-    if region:
-        query = query.filter(QcSlice.region.contains(region))
+    if selected_channels:
+        query = query.filter(QcSlice.channel.in_(selected_channels))
+    if selected_games:
+        query = query.filter(QcSlice.game.in_(selected_games))
+    if selected_regions:
+        query = query.filter(QcSlice.region.in_(selected_regions))
     include_kb_rows = item_type in (None, "knowledge_suggestion")
     for suggestion, slice_row, conversation in query.order_by(QcSliceKnowledgeSuggestion.created_at.desc()).all():
         assignment = kb_assignments.get(suggestion.id)
-        if user.role == "admin" and assignee_id and (not assignment or assignment.assignee_id != assignee_id):
+        if user.role == "admin" and selected_assignees and (not assignment or assignment.assignee_id not in selected_assignees):
             continue
         if not _matches(assignment, user, scope, status):
             continue

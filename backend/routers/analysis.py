@@ -29,6 +29,9 @@ STALE_ANALYSIS_GRACE_SECONDS = 30
 INTERRUPTED_ANALYSIS_MESSAGE = "分析任务因后端服务重启或进程终止而中断，MaaS 返回结果未落库；请重新上传分析。"
 PARSE_CONCURRENCY = 2
 PARSE_SEMAPHORE = threading.Semaphore(PARSE_CONCURRENCY)
+PARSE_ACTIVE: set[int] = set()
+PARSE_ACTIVE_LOCK = threading.Lock()
+STALE_PARSE_SECONDS = 90
 TERMINAL_BATCH_STATUSES = ("completed", "partial", "failed", "done")
 UPLOADABLE_BATCH_STATUSES = ("uploading", "paused", "pending", "parsing")
 STARTABLE_BATCH_STATUSES = ("uploading", "pending", "parsing")
@@ -528,9 +531,8 @@ def _parse_registered_file(db: DbSession, batch: AnalysisBatch, uploaded: Upload
         kind = sqlite_error_kind(exc)
         if kind == "malformed":
             db.rollback()
-            raise HTTPException(500, sqlite_user_message(exc, "解析入库")) from exc
-        _set_file_failure(db, uploaded_id, "数据库繁忙，请稍后重试解析")
-        raise HTTPException(503, sqlite_user_message(exc, "解析入库")) from exc
+            return _set_file_failure(db, uploaded_id, sqlite_user_message(exc, "解析入库"))
+        return _set_file_failure(db, uploaded_id, "数据库繁忙，请稍后重试解析")
     except Exception as exc:
         return _set_file_failure(db, uploaded_id, str(exc) or "解析结果入库失败")
 
@@ -637,8 +639,15 @@ def upload_batch_file(
 
 
 @router.get("/batch/{batch_id}/upload-status")
-def get_upload_status(batch_id: int, user: User = Depends(require_admin), db: DbSession = Depends(get_db)):
-    return _upload_status_payload(db, _owned_upload_batch(db, batch_id, user))
+def get_upload_status(
+    batch_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(require_admin),
+    db: DbSession = Depends(get_db),
+):
+    batch = _owned_upload_batch(db, batch_id, user)
+    _requeue_stale_parses(db, batch, background_tasks)
+    return _upload_status_payload(db, batch)
 
 
 @router.post("/batch/{batch_id}/files/{file_id}/retry-parse")
@@ -659,7 +668,12 @@ def retry_file_parse(
         raise HTTPException(404, "上传文件记录不存在")
     if uploaded.status == "parsed":
         return _serialize_upload_file(uploaded)
-    if uploaded.status != "parse_failed":
+    if uploaded.status == "parsing":
+        with PARSE_ACTIVE_LOCK:
+            running = uploaded.id in PARSE_ACTIVE
+        if running:
+            return _serialize_upload_file(uploaded)
+    elif uploaded.status != "parse_failed":
         raise HTTPException(409, "当前文件状态不能重试解析")
     if not uploaded.stored_path or not os.path.isfile(uploaded.stored_path):
         raise HTTPException(409, "服务端原文件不存在，请重新选择文件上传")
@@ -1069,6 +1083,8 @@ def delete_batch(batch_id: int, _: User = Depends(require_admin), db: DbSession 
     return {"message": "批次及其关联数据已删除", "batch_id": batch_id}
 def _parse_file_job(batch_id: int, file_id: int) -> None:
     PARSE_SEMAPHORE.acquire()
+    with PARSE_ACTIVE_LOCK:
+        PARSE_ACTIVE.add(file_id)
     db = SessionLocal()
     try:
         uploaded = db.query(UploadedFile).filter(UploadedFile.id == file_id, UploadedFile.batch_id == batch_id).first()
@@ -1078,9 +1094,43 @@ def _parse_file_job(batch_id: int, file_id: int) -> None:
         _parse_registered_file(db, batch, uploaded)
     except Exception:
         traceback.print_exc()
+        try:
+            _set_file_failure(db, file_id, "解析任务异常中断，请重试解析")
+        except Exception:
+            db.rollback()
     finally:
         db.close()
+        with PARSE_ACTIVE_LOCK:
+            PARSE_ACTIVE.discard(file_id)
         PARSE_SEMAPHORE.release()
+
+
+def _requeue_stale_parses(db: DbSession, batch: AnalysisBatch, background_tasks: BackgroundTasks) -> None:
+    """Restart parse jobs lost after a restart or a dead background worker."""
+    now = utcnow()
+    rows = db.query(UploadedFile).filter(
+        UploadedFile.batch_id == batch.id,
+        UploadedFile.status == "parsing",
+    ).all()
+    changed = False
+    for row in rows:
+        with PARSE_ACTIVE_LOCK:
+            running = row.id in PARSE_ACTIVE
+        if running:
+            continue
+        age = (now - (row.parse_started_at or now)).total_seconds()
+        if age < STALE_PARSE_SECONDS:
+            continue
+        if row.stored_path and os.path.isfile(row.stored_path):
+            row.parse_started_at = now
+            row.updated_at = now
+            changed = True
+            background_tasks.add_task(_parse_file_job, batch.id, row.id)
+        else:
+            _set_file_failure(db, row.id, "上传中断，原文件不存在，请重新选择后上传")
+            changed = True
+    if changed:
+        db.commit()
 
 
 def _claim_slices(db, batch_id: int, eligible_ids: set[int], limit: int) -> list[int]:

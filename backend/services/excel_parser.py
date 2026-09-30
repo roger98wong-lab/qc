@@ -6,6 +6,7 @@ import re
 import json
 import numbers
 import os
+from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 import pandas as pd
 from datetime import datetime
@@ -346,7 +347,8 @@ def is_overseas_dataframe(df: pd.DataFrame) -> bool:
     return OVERSEAS_NEW_COLUMNS.issubset(columns) and bool(columns & OVERSEAS_TEXT_COLUMNS)
 
 
-def _cell_text(value) -> str:
+def _cell_text(value, *, identifier: bool = False) -> str:
+    """Return a stable cell string, optionally normalizing identifier values."""
     if value is None:
         return ""
     try:
@@ -364,8 +366,14 @@ def _cell_text(value) -> str:
     text = str(value).strip()
     if text.endswith(".0") and text[:-2].isdigit():
         return text[:-2]
-    return str(value)
-
+    if identifier and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)[eE][+-]?\d+", text):
+        try:
+            decimal = Decimal(text)
+            if decimal.is_finite() and decimal == decimal.to_integral_value():
+                return format(decimal, "f")
+        except (InvalidOperation, ValueError):
+            pass
+    return text
 
 def normalize_content_type(value) -> str:
     """Normalize overseas contentType without forcing unknown values into 0/1/2/3."""
@@ -691,8 +699,9 @@ def parse_vip_messages(content_str: str) -> list[dict]:
             lookahead = " ".join(lines[i+1:i+3])
             is_ai = any(mk in lookahead for mk in VIP_AI_MARKERS)
             is_user = "用户" in role or "🤵" in role
+            is_auto = "auto_reply" in role.lower()
             messages.append({"role": role, "ts": ts, "content": body,
-                              "is_ai": is_ai, "is_user": is_user})
+                              "is_ai": is_ai, "is_user": is_user, "is_auto": is_auto})
         elif messages:
             # Excel exports wrap long replies across physical lines.  Those
             # lines belong to the preceding timestamped message, not to a
@@ -899,6 +908,37 @@ def _is_discord_command_role(role: str) -> bool:
     return _normalize_role_key(_role_person_token(text)) in _DISCORD_COMMAND_ROLES
 
 
+_SYSTEM_IDENTITY_ROLES = frozenset({
+    "system",
+    "系统",
+    "server",
+    "bot",
+    "robot",
+})
+
+
+def _is_system_identity_role(role: str) -> bool:
+    """True for the Excel system identity, not a named human agent.
+
+    Match the whole role, or the token left after stripping 客服/agent prefixes.
+    ``客服-system`` / ``客服-server`` must not become human_agent.
+    """
+    text = str(role or "").strip()
+    if not text:
+        return False
+    if _normalize_role_key(text) in _SYSTEM_IDENTITY_ROLES:
+        return True
+    return _normalize_role_key(_role_person_token(text)) in _SYSTEM_IDENTITY_ROLES
+
+
+def _is_system_push_role(role: str) -> bool:
+    """True for campaign/system push identities such as uce_push and external_push."""
+    if _is_uce_push_role(role):
+        return True
+    token = _normalize_role_key(_role_person_token(role))
+    return token == "push" or token.endswith("_push")
+
+
 _AGENT_ROLE_PREFIX = re.compile(
     r"^(?:客服|人工客服|human_agent|operator|agent)[\s\-–—－:：/、]+",
     re.IGNORECASE,
@@ -927,6 +967,33 @@ def _looks_like_person_role(role: str) -> bool:
     return True
 
 
+def is_broadcast_kefu_message(role: str, text: str) -> bool:
+    """Identify obvious campaign broadcasts from an otherwise bare 客服 role.
+
+    Bare 客服 is still a valid one-to-one FB/LINE reply by default.  Only
+    announcement signals strong enough to outweigh that ambiguity are treated
+    as system pushes.
+    """
+    token = _role_person_token(role).strip()
+    if token not in {"", "客服"}:
+        return False
+    body = str(text or "").strip()
+    if not body:
+        return False
+    lower = body.lower()
+    has_url = bool(re.search(r"https?://|www\.|top\s*-?up\s*(?:link|url)", lower)) or bool(re.search(r"(?:官网.*(?:储值|充值|支付)|(?:储值|充值|支付).*(?:链接|网址|官网))", lower))
+    has_named_campaign = bool(re.search(r"lunar\s+mecha|mecha\s+palace|dear\s+commander|指挥官", lower))
+    has_event_marker = bool(re.search(r"活动|公告|announcement|campaign|event|promotion|limited[- ]time", lower))
+    has_date_or_time = bool(re.search(r"\b(?:20\d{2}[-/.年]\d{1,2}|\d{1,2}[:：]\d{2}|\d{1,2}月\d{1,2}|until|from)\b", lower))
+    paragraphs = len(re.split(r"\n\s*\n", body)) > 1 or body.count("\n") >= 1
+    emoji_count = len(re.findall(r"[\U0001F300-\U0001FAFF]", body))
+    return (
+        has_url
+        or has_named_campaign
+        or (has_event_marker and (paragraphs or has_date_or_time))
+        or (emoji_count >= 4 and len(body) >= 30)
+    )
+
 def _message_speaker(message: dict) -> str:
     """Map parser facts to the compact slice protocol; never infer from text."""
     if message.get("is_user"):
@@ -935,11 +1002,15 @@ def _message_speaker(message: dict) -> str:
         return "ai"
     if message.get("is_auto"):
         return "system"
+    if is_broadcast_kefu_message(message.get("role") or "", message.get("content") or ""):
+        return "system"
     # System campaign pushes reuse the 客服- prefix. Classify them before the
     # generic agent markers so they never become human_agent.
-    if _is_uce_push_role(message.get("role") or ""):
+    if _is_system_push_role(message.get("role") or ""):
         return "system"
     if _is_discord_command_role(message.get("role") or ""):
+        return "system"
+    if _is_system_identity_role(message.get("role") or ""):
         return "system"
     # A residual role is human only when the source explicitly identifies a
     #客服/agent.  Other unrecognised source values remain ``unknown`` instead
@@ -1201,14 +1272,19 @@ def _parse_vip(df: pd.DataFrame) -> tuple[list[dict], list[dict], str | None]:
     kb_suggestions = []
     for _, row in df.iterrows():
         game       = str(row.get("游戏", ""))
-        role_id    = str(row.get("角色ID", ""))
+        role_id    = _cell_text(row.get("角色ID"), identifier=True)
         role_name  = str(row.get("角色名", ""))
         kefu_raw   = str(row.get("客服", ""))
         content    = str(row.get("消息内容", ""))
 
-        msgs = parse_vip_messages(content)
-        region = resolve_vip_region(kefu_raw, msgs)
+        parsed_msgs = parse_vip_messages(content)
+        region = resolve_vip_region(kefu_raw, parsed_msgs)
         game, region = _force_mushroom_rush_to_sea_adventure(game, region)
+        # VIP rows use the same speaker and system filtering as standard
+        # channels.  In particular, system/push-only rows never reach MaaS.
+        msgs = _filter_standard_messages(parsed_msgs)
+        if not msgs:
+            continue
 
         slice_id = f"{game}|{role_id}"
         slice_payload = json.loads(_compact_slice(msgs, 0, slice_id=slice_id, channel="VIP", game=game, region=region))
@@ -1227,18 +1303,15 @@ def _parse_vip(df: pd.DataFrame) -> tuple[list[dict], list[dict], str | None]:
                     "language": guess_language(msg["content"]),
                 })
 
-        # 提取人工客服KB建议
+        # KB extraction must see exactly the messages that enter the slice.
         kb_suggestions.extend(extract_human_kb_suggestions(msgs, game, region, "VIP"))
-
-        if not msgs:
-            continue
 
         last_ts = next((m["msg_time"] for m in reversed(ai_msgs) if m["msg_time"]), None)
         sessions.append({
             "channel":      "VIP",
             "game":         game,
-            "region":       region,
-            "session_uid":  f"{game}|{role_id}",
+            "region":        region,
+            "session_uid":   f"{game}|{role_id}",
             "session_link": None,
             "user_name":    role_name,
             "reply_time":   last_ts,
@@ -1249,23 +1322,44 @@ def _parse_vip(df: pd.DataFrame) -> tuple[list[dict], list[dict], str | None]:
         })
     return sessions, kb_suggestions, None
 
-
 def _parse_standard(df: pd.DataFrame, channel: str) -> tuple[list[dict], list[dict], str | None]:
     required = ["对话记录"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         return [], [], f"{channel}文件缺少必填列: {missing}"
 
+    identifier_columns = {"用户id（三方渠道的）", "对话ID", "会话ID"}
+
     def get_col(row, *candidates):
         for c in candidates:
             if c in row.index and pd.notna(row[c]):
-                return str(row[c])
+                return _cell_text(row[c], identifier=c in identifier_columns)
         return ""
+
+    def row_reply_person(row) -> tuple[str, bool]:
+        """Read 回复人/客服 if those headers exist.
+
+        An empty agent column means this row was not handled by a named
+        agent (often a broadcast labelled only as [客服] in 对话记录).
+        Those rows must not be sliced or sent to MaaS. Workbooks without
+        either header keep the previous dialogue-only behaviour.
+        """
+        present = False
+        for col in ("回复人", "客服"):
+            if col not in row.index:
+                continue
+            present = True
+            value = _cell_text(row.get(col)).strip()
+            if value and value.lower() != "nan":
+                return value, True
+        return "", present
 
     sessions = []
     kb_suggestions = []
     for _, row in df.iterrows():
-        reply_person = get_col(row, "回复人", "客服")
+        reply_person, has_agent_col = row_reply_person(row)
+        if has_agent_col and not reply_person:
+            continue
         game     = get_col(row, "游戏")
         region   = get_col(row, "地区")
         link     = get_col(row, "会话链接")

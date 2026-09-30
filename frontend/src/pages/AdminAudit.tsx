@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { Alert, Card, Descriptions, Drawer, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Card, Descriptions, Drawer, Select, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd'
 import { adminApi } from '../api'
 import { ConversationMessageList, conversationFromIssue, formatConversationTime } from '../components/Conversation'
 import { useAuthStore } from '../store/auth'
+import HandoffTopTab from './HandoffTopTab'
 
 const { Title, Text } = Typography
 
@@ -49,12 +50,20 @@ export default function AdminAudit() {
     { title: '操作', render: (_: any, row: any) => <a onClick={() => adminApi.getAuditSlice(row.id).then(r => setDetail(r.data))}>详情</a> },
   ]
   const detailRow = detail || {}
-  const transcript = detailRow.messages ? { conversation_id: detailRow.conversation_id || detailRow.slice_id, messages: detailRow.messages } : conversationFromIssue(detailRow)
-  return <div className="qc-admin-audit-page">
-    <Title level={4} className="page-heading">分析审计</Title>
-    <Card extra={<Select allowClear placeholder="选择分析状态" style={{ width: 140 }} value={status} onChange={setStatus} options={['pending', 'processing', 'completed', 'partial', 'failed'].map(v => ({ value: v, label: ANALYSIS_STATUS_LABELS[v] }))} />}>
+  const transcript = conversationFromIssue(detailRow)
+  const sliceTable = <Card extra={<Select allowClear placeholder="选择分析状态" style={{ width: 140 }} value={status} onChange={setStatus} options={['pending', 'processing', 'completed', 'partial', 'failed'].map(v => ({ value: v, label: ANALYSIS_STATUS_LABELS[v] }))} />}>
       <Table rowKey="id" loading={loading} dataSource={rows} columns={columns} scroll={{ x: 1000 }} size="small" locale={{ emptyText: '暂无分析记录' }} />
     </Card>
+  return <div className="qc-admin-audit-page">
+    <Title level={4} className="page-heading">分析审计</Title>
+    <Tabs
+      className="qc-admin-audit-tabs"
+      destroyInactiveTabPane
+      items={[
+        { key: 'slices', label: '切片审计', children: sliceTable },
+        { key: 'handoff-top', label: '转人工类型 TOP', children: <HandoffTopTab onOpenDetail={id => adminApi.getAuditSlice(id).then(r => setDetail(r.data))} /> },
+      ]}
+    />
     <Drawer title="切片分析详情" placement="right" width="40vw" open={!!detail} onClose={() => setDetail(null)} className="qc-issue-drawer">
       {detail && <Space direction="vertical" style={{ width: '100%' }} size={16}>
         <Descriptions bordered column={1} size="small">
@@ -65,6 +74,7 @@ export default function AdminAudit() {
           <Descriptions.Item label="分析状态"><StatusTag value={detailRow.analysis_status} labels={ANALYSIS_STATUS_LABELS} /></Descriptions.Item>
           <Descriptions.Item label="知识建议"><StatusTag value={detailRow.knowledge_decision} labels={KNOWLEDGE_DECISION_LABELS} /></Descriptions.Item>
           <Descriptions.Item label="分析时间"><Tooltip title={displayValue(detailRow.completed_at || detailRow.started_at || detailRow.created_at)}>{formatDateTime(detailRow.completed_at || detailRow.started_at || detailRow.created_at)}</Tooltip></Descriptions.Item>
+          {detailRow.human_handoff ? <Descriptions.Item label="转人工">{displayValue(detailRow.human_handoff.reason_type)} · {detailRow.human_handoff.handoff_occurred ? '已转人工' : '未转人工'}</Descriptions.Item> : null}
         </Descriptions>
         <ConversationMessageList conversation={transcript} emptyText="暂无切片消息" />
         {detailRow.error_message && <Text type="danger">错误：{detailRow.error_message}</Text>}

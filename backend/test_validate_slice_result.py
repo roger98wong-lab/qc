@@ -40,6 +40,12 @@ def payload():
     }
 
 
+def payload_without_human():
+    data = payload()
+    data["messages"] = [item for item in data["messages"] if item["speaker"] != "human_agent"]
+    return data
+
+
 def translation(message_id, text="ok"):
     return {
         "message_id": message_id,
@@ -66,6 +72,45 @@ def handoff(**overrides):
     }
     data.update(overrides)
     return data
+
+
+
+def knowledge_skip():
+    return {
+        "answer_source": "human_agent",
+        "decision": "no_human_answer",
+        "is_candidate": False,
+        "validation_status": "not_applicable",
+        "confidence": 1,
+        "category": None,
+        "question_message_ids": [],
+        "answer_message_ids": [],
+        "feedback_message_ids": [],
+        "evidence_message_ids": [],
+        "title": None,
+        "standard_questions": [],
+        "standard_answer": None,
+        "reason": "无人工回复",
+        "reject_reason": None,
+        "needs_manual_review": False,
+        "manual_review_reason": None,
+    }
+
+
+def analyzed_result(handoff_data, source=None):
+    src = source or payload()
+    return {
+        "schema_version": "2.0.0",
+        "slice_id": "slice-001",
+        "analysis_status": "completed",
+        "messages": [translation(item["message_id"]) for item in src["messages"]],
+        "quality_check": {"has_issue": False, "issues": []},
+        "human_handoff": handoff_data,
+        "knowledge_suggestion": knowledge_skip(),
+        "term_suggestions": {"has_terms": False, "terms": []},
+        "warnings": [],
+        "errors": [],
+    }
 
 
 class ValidateSliceResultTest(unittest.TestCase):
@@ -243,6 +288,261 @@ class ValidateSliceResultTest(unittest.TestCase):
                     "manual_review_reason": None,
                 },
             }, payload())
+
+    def test_attachment_required_before_handoff(self):
+        no_human = payload_without_human()
+        result = validate_slice_result(analyzed_result(handoff(
+            decision="handoff_required",
+            handoff_occurred=False,
+            reason_type="玩家消息包含附件",
+            evidence_message_ids=["m001"],
+            reason="玩家发送了截图。",
+        ), no_human), no_human)
+        self.assertEqual(result["human_handoff"]["reason_type"], "玩家消息包含附件")
+        self.assertFalse(result["human_handoff"]["handoff_occurred"])
+
+    def test_sticker_reasonable_after_handoff(self):
+        result = validate_slice_result(analyzed_result(handoff(
+            reason_type="玩家发送表情贴纸",
+            evidence_message_ids=["m001", "m010"],
+            reason="玩家发送了表情贴纸后接入人工。",
+        )), payload())
+        self.assertEqual(result["human_handoff"]["reason_type"], "玩家发送表情贴纸")
+        self.assertTrue(result["human_handoff"]["handoff_occurred"])
+
+    def test_attachment_rejects_not_required(self):
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(analyzed_result(handoff(
+                decision="handoff_not_required",
+                handoff_occurred=False,
+                reason_type="玩家消息包含附件",
+                evidence_message_ids=["m001"],
+            )), payload())
+
+    def test_sticker_rejects_unreasonable(self):
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(analyzed_result(handoff(
+                decision="handoff_unreasonable",
+                handoff_occurred=True,
+                reason_type="玩家发送表情贴纸",
+                evidence_message_ids=["m001"],
+            )), payload())
+
+    def test_attachment_requires_player_evidence(self):
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(analyzed_result(handoff(
+                reason_type="玩家消息包含附件",
+                evidence_message_ids=["m010"],
+            )), payload())
+
+    def test_unknown_reason_type_still_rejected(self):
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(analyzed_result(handoff(
+                reason_type="玩家消息涉及附件",
+                evidence_message_ids=["m001"],
+            )), payload())
+
+
+
+    def test_player_and_human_cannot_be_handoff_required(self):
+        with self.assertRaises(AnalysisProtocolError) as raised:
+            validate_slice_result(analyzed_result(handoff(
+                decision="handoff_required",
+                handoff_occurred=False,
+                reason_type="玩家明确要求人工",
+                evidence_message_ids=["m001"],
+                reason="应转未转。",
+            )), payload())
+        self.assertIn("应转未转", str(raised.exception))
+
+    def test_player_and_ai_can_be_handoff_required(self):
+        no_human = payload_without_human()
+        result = validate_slice_result(analyzed_result(handoff(
+            decision="handoff_required",
+            handoff_occurred=False,
+            reason_type="玩家明确要求人工",
+            evidence_message_ids=["m001"],
+            reason="玩家要求人工但尚未转接。",
+        ), no_human), no_human)
+        self.assertEqual(result["human_handoff"]["decision"], "handoff_required")
+        self.assertFalse(result["human_handoff"]["handoff_occurred"])
+
+    def test_human_only_cannot_mark_handoff_occurred(self):
+
+        human_only = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "DC",
+            "game": "冒险大作战",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m010", "speaker": "human_agent", "text": "LUNAR MECHA PALACE", "sequence": 1},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m010")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m010"]),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        with self.assertRaises(AnalysisProtocolError) as raised:
+            validate_slice_result(result, human_only)
+        self.assertIn("不得判定已发生转人工", str(raised.exception))
+
+    def test_human_without_transfer_form_cannot_infer_occurred(self):
+        no_form = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "DC",
+            "game": "冒险大作战",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "How do I claim?", "sequence": 1},
+                {"message_id": "m010", "speaker": "human_agent", "text": "Tap Claim in the event.", "sequence": 2},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m010")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m010"]),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(result, no_form)
+
+    def test_ai_assistant_greeting_system_cannot_mark_occurred(self):
+        greeting = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "VK",
+            "game": "热血神剑",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "hello", "sequence": 1},
+                {"message_id": "m002", "speaker": "system", "text": "您好，我是 AI 助手，帮助回答您的问题~", "sequence": 2},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m002")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m002"], reason="系统已出现。"),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(result, greeting)
+
+    def test_offline_registration_queue_allows_occurred_without_human(self):
+
+        queued = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "VK",
+            "game": "热血神剑",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "account stolen", "sequence": 1},
+                {"message_id": "m002", "speaker": "ai", "text": "please wait", "sequence": 2},
+                {"message_id": "m005", "speaker": "system", "text": "Operator is currently offline. I have registered your issue.", "sequence": 3},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m002"), translation("m005")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(
+                evidence_message_ids=["m001", "m005"],
+                reason="系统已登记并排队等待人工上线。",
+            ),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        validated = validate_slice_result(result, queued)
+        self.assertTrue(validated["human_handoff"]["handoff_occurred"])
+
+    def test_system_transfer_then_human_allows_occurred_without_ai(self):
+
+        line_payload = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "LINE",
+            "game": "主宰世界",
+            "region": "日本",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "錬丹達人", "sequence": 1},
+                {"message_id": "m002", "speaker": "system", "text": "担当者におつなぎしました。しばらくお待ちください", "sequence": 2},
+                {"message_id": "m010", "speaker": "human_agent", "text": "こんにちは。", "sequence": 3},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m002"), translation("m010")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m002", "m010"], reason="系统已转接且人工已回复。"),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        validated = validate_slice_result(result, line_payload)
+        self.assertTrue(validated["human_handoff"]["handoff_occurred"])
+
+    def test_transfer_form_submitted_allows_occurred_without_ai(self):
+        form_payload = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "官网客服",
+            "game": "冒险大作战",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "login failed", "sequence": 1},
+                {
+                    "message_id": "m003",
+                    "speaker": "system",
+                    "text": "转人工表单-已提交并生成工单",
+                    "content_type": "3",
+                    "event_type": "transfer_form_submitted",
+                    "sequence": 2,
+                },
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m003")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m003"], reason="端内转人工表单已提交。"),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        validated = validate_slice_result(result, form_payload)
+        self.assertTrue(validated["human_handoff"]["handoff_occurred"])
 
 
 if __name__ == "__main__":

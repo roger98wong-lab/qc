@@ -71,6 +71,23 @@ function resolvedAgentName(message: any, role: ConversationRole, record: any): s
   }
   return null
 }
+const GENERIC_AI_NAMES = new Set(['ai', 'assistant', 'bot', 'robot', '人工智能', '智能客服', 'ai回复'])
+function resolvedAiName(message: any, role: ConversationRole): string | null {
+  if (role !== 'ai') return null
+  const candidates = [message?.agent_name, message?.ai_name, message?.speaker_source]
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim()
+    if (!raw) continue
+    const match = raw.match(/^(?:客服|人工客服|human_agent|agent|operator|AI|智能客服)\s*[-—–:：/]\s*(.+)$/i)
+    const name = (match?.[1] || raw).trim()
+    if (!name || GENERIC_AI_NAMES.has(name.toLowerCase()) || name === 'AI') continue
+    if (name.length <= 32 && !/[.?!。！？\n\r{}\[\]"]/.test(name)) return name
+  }
+  return null
+}
+function resolvedSpeakerName(message: any, role: ConversationRole, record: any): string | null {
+  return resolvedAgentName(message, role, record) || resolvedAiName(message, role)
+}
 function transferFormFields(raw: any) {
   return {
     content_type: raw?.content_type ?? raw?.contentType ?? null,
@@ -133,7 +150,7 @@ export function conversationFromIssue(issue: any): Conversation {
       return {
       message_id: String(message.message_id || `${prefix}-message-${index}`), sequence: message.sequence ?? index,
       speaker_source: message.speaker_source ?? message.speaker ?? null,
-      agent_name: resolvedAgentName(message, role, issue),
+      agent_name: resolvedSpeakerName(message, role, issue),
       role,
       created_at: message.created_at ?? null, original_text: String(message.original_text || message.text || ''),
       source_language: message.source_language ?? issue.language ?? null, translation: normalizeTranslation(message.translation, String(message.original_text || message.text || ''), message.source_language || issue.language),
@@ -148,7 +165,7 @@ export function conversationFromIssue(issue: any): Conversation {
       const role = resolveConversationRole(raw)
       return {
         message_id: String(raw.message_id ?? `${prefix}-message-${index}`), sequence: raw.sequence ?? index,
-        speaker_source: raw.speaker_source ?? raw.speaker ?? null, agent_name: raw.agent_name ?? (role === 'human_agent' ? issue.agent_name ?? issue.human_agent_name ?? null : null), role, created_at: raw.created_at ?? raw.msg_time ?? null,
+        speaker_source: raw.speaker_source ?? raw.speaker ?? null, agent_name: resolvedSpeakerName(raw, role, issue), role, created_at: raw.created_at ?? raw.msg_time ?? null,
         original_text: original, source_language: raw.source_language ?? issue.language ?? null,
         translation: normalizeTranslation(raw.translation, original, raw.source_language ?? issue.language),
         reference_tags: raw.reference_tags,
@@ -173,7 +190,7 @@ export function conversationFromIssue(issue: any): Conversation {
           return {
             message_id: String(raw.message_id ?? `${prefix}-context-${index}`),
             sequence: raw.sequence ?? index, speaker_source: raw.speaker_source ?? raw.speaker ?? null,
-            agent_name: raw.agent_name ?? (role === 'human_agent' ? issue.agent_name ?? issue.human_agent_name ?? null : null),
+            agent_name: resolvedSpeakerName(raw, role, issue),
             role, created_at: raw.created_at ?? null, original_text: original,
             source_language: raw.source_language ?? issue.language ?? null,
             translation: normalizeTranslation(raw.translation, original, raw.source_language ?? issue.language),
@@ -206,7 +223,7 @@ export function conversationFromCandidate(candidate: any): Conversation {
       return {
       message_id: String(message.message_id || `${prefix}-message-${index}`), sequence: message.sequence ?? index,
       speaker_source: message.speaker_source ?? message.speaker ?? null,
-      agent_name: resolvedAgentName(message, role, candidate),
+      agent_name: resolvedSpeakerName(message, role, candidate),
       role,
       created_at: message.created_at ?? null, original_text: String(message.original_text || message.text || ''),
       source_language: message.source_language ?? candidate.language ?? null, translation: normalizeTranslation(message.translation, String(message.original_text || message.text || ''), message.source_language || candidate.language),
@@ -227,7 +244,7 @@ export function conversationFromCandidate(candidate: any): Conversation {
       const role = resolveConversationRole(raw)
       return {
         message_id: String(raw.message_id ?? `${prefix}-message-${index}`), sequence: raw.sequence ?? index,
-        speaker_source: raw.speaker_source ?? raw.speaker ?? null, agent_name: resolvedAgentName(raw, role, candidate), role, created_at: raw.created_at ?? raw.msg_time ?? null,
+        speaker_source: raw.speaker_source ?? raw.speaker ?? null, agent_name: resolvedSpeakerName(raw, role, candidate), role, created_at: raw.created_at ?? raw.msg_time ?? null,
         original_text: original, source_language: raw.source_language ?? candidate.language ?? null,
         translation: normalizeTranslation(raw.translation, original, raw.source_language ?? candidate.language),
         reference_tags: raw.reference_tags,
@@ -272,15 +289,13 @@ export function ConversationMessageList({ conversation, loading = false, error, 
       const showToggle = !!translation && translation.status !== 'not_required' && !!translation.translated_text
       const defaultTranslationOpen = translation?.status === 'success' || translation?.status === 'uncertain'
       const showTranslation = expanded[message.message_id] ?? defaultTranslationOpen
-      const humanAgentName = message.role === 'human_agent' && message.agent_name?.trim()
-        ? message.agent_name.trim()
-        : null
+      const speakerName = message.agent_name?.trim() || null
       const form = resolveTransferFormPresentation(message)
       const rawExpanded = expanded[`${message.message_id}-raw`] === true
       return <div key={message.message_id} ref={node => { refs.current[message.message_id] = node }} className={`qc-conversation-row qc-role-${ROLE_CLASS[message.role]} ${highlighted === message.message_id ? 'is-highlighted' : ''}`}>
         <div className="qc-conversation-bubble">
           <div className="qc-conversation-meta">
-            <span className="qc-conversation-identity"><Tag className="qc-role-tag">{ROLE_LABEL[message.role]}</Tag>{form.eventLabel ? <Tag className="qc-event-tag">{form.eventLabel}</Tag> : null}{humanAgentName ? <Typography.Text className="qc-human-agent-name">{humanAgentName}</Typography.Text> : null}</span>
+            <span className="qc-conversation-identity"><Tag className="qc-role-tag">{ROLE_LABEL[message.role]}</Tag>{form.eventLabel ? <Tag className="qc-event-tag">{form.eventLabel}</Tag> : null}{speakerName ? <Typography.Text className={message.role === 'human_agent' ? 'qc-human-agent-name' : 'qc-ai-name'}>{speakerName}</Typography.Text> : null}</span>
             {message.created_at && <Typography.Text type="secondary">{formatConversationTime(message.created_at)}</Typography.Text>}
             {message.reference_tags?.length ? <span className="qc-message-reference-tags">{message.reference_tags.map(tag => <Tag key={tag} className="qc-message-ref">{tag}</Tag>)}</span> : null}
           </div>

@@ -28,7 +28,9 @@ HANDOFF_REASON_TYPES = (
     "玩家明确要求人工", "需要人工权限或后台处理", "需要身份或资料核验",
     "敏感或高风险事项", "AI方案无效或问题持续", "投诉或情绪升级",
     "超出AI安全处理范围", "可由AI继续处理", "证据不足",
+    "玩家消息包含附件", "玩家发送表情贴纸",
 )
+MUST_HANDOFF_REASON_TYPES = ("玩家消息包含附件", "玩家发送表情贴纸")
 DECISION_VALIDATION_STATUS = {
     "candidate_ready": "player_validated",
     "candidate_needs_enrichment": "player_validated",
@@ -145,13 +147,83 @@ def _optional_text(value):
     return text or None
 
 
-def _validate_human_handoff(handoff, message_roles: dict[str, str]) -> dict:
+def _normalize_content_type_token(value) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def _slice_has_transfer_form_event(messages) -> bool:
+    """True when the slice carries an in-app transfer-form submitted event."""
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        event_type = str(message.get("event_type") or "").strip().lower()
+        if event_type == "transfer_form_submitted":
+            return True
+        if _normalize_content_type_token(message.get("content_type")) == "3":
+            return True
+    return False
+
+
+_TRANSFER_PROCESS_MARKERS = (
+    "转接", "已转", "登记", "记录了您的问题", "记录了你的问题", "已记录您的问题", "已记录你的问题",
+    "上线后", "优先处理", "已受理", "排队",
+    "おつなぎ", "つなぎしました",
+    "transferred you", "registered your", "when an agent is online", "when the operator",
+    "handled with priority",
+    "зарегистрировал",
+)
+
+
+def _message_body(message: dict) -> str:
+    return str(message.get("text") or message.get("content") or "")
+
+
+def _slice_has_transfer_like_system_message(messages) -> bool:
+    """True when a system/auto_reply body looks like transfer or offline queue."""
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        speaker = str(message.get("speaker") or "")
+        is_system = speaker == "system" or message.get("is_auto")
+        if not is_system:
+            continue
+        blob = _message_body(message).lower()
+        if any(marker.lower() in blob for marker in _TRANSFER_PROCESS_MARKERS):
+            return True
+    return False
+
+
+def _slice_has_visible_transfer_process(message_roles: dict[str, str], messages=None) -> bool:
+    """Allow occurred=true without AI only when a transfer action is visible.
+
+    Greeting auto_replies such as “我是 AI 助手” are speaker=system but are
+    not a transfer. Pure player+human still returns False.
+    """
+    del message_roles
+    if _slice_has_transfer_form_event(messages):
+        return True
+    return _slice_has_transfer_like_system_message(messages)
+
+
+def _validate_human_handoff(handoff, message_roles: dict[str, str], payload_messages=None) -> dict:
     if not isinstance(handoff, dict) or handoff.get("decision") not in HANDOFF_DECISIONS:
         raise AnalysisProtocolError("human_handoff.decision 非法或缺失")
     decision = handoff["decision"]
     occurred = _require_bool(handoff.get("handoff_occurred"), "human_handoff.handoff_occurred")
-    if handoff.get("reason_type") not in HANDOFF_REASON_TYPES:
+    has_ai = any(role == "ai" for role in message_roles.values())
+    if occurred and not has_ai and not _slice_has_visible_transfer_process(message_roles, payload_messages):
+        raise AnalysisProtocolError("无 AI、无转接表单、也无系统转接过程时不得判定已发生转人工")
+    reason_type = handoff.get("reason_type")
+    if reason_type not in HANDOFF_REASON_TYPES:
         raise AnalysisProtocolError("human_handoff.reason_type 非法或缺失")
+    has_human = any(role == "human_agent" for role in message_roles.values())
+    if decision == "handoff_required" and has_human:
+        raise AnalysisProtocolError("已有人工客服消息时不得判定应转未转")
     if decision == "handoff_required" and occurred:
         raise AnalysisProtocolError("handoff_required 时必须尚未转人工")
     if decision == "handoff_reasonable" and not occurred:
@@ -160,6 +232,8 @@ def _validate_human_handoff(handoff, message_roles: dict[str, str]) -> dict:
         raise AnalysisProtocolError("handoff_not_required 时必须尚未转人工")
     if decision == "handoff_unreasonable" and not occurred:
         raise AnalysisProtocolError("handoff_unreasonable 时必须已经转人工")
+    if reason_type in MUST_HANDOFF_REASON_TYPES and decision not in ("handoff_required", "handoff_reasonable"):
+        raise AnalysisProtocolError("附件或表情贴纸类只能判定为应转或合理转")
     needs_review = _require_bool(handoff.get("needs_manual_review"), "human_handoff.needs_manual_review")
     review_reason = _optional_text(handoff.get("manual_review_reason"))
     if decision == "manual_review":
@@ -167,14 +241,17 @@ def _validate_human_handoff(handoff, message_roles: dict[str, str]) -> dict:
             raise AnalysisProtocolError("human_handoff 需人工复核时必须填写原因")
     elif needs_review or review_reason:
         raise AnalysisProtocolError("非人工复核时不得填写 human_handoff.manual_review_reason")
+    evidence_ids = _require_message_ids(
+        handoff.get("evidence_message_ids", []), "human_handoff.evidence_message_ids", message_roles,
+    )
+    if reason_type in MUST_HANDOFF_REASON_TYPES and not any(message_roles.get(mid) == "player" for mid in evidence_ids):
+        raise AnalysisProtocolError("附件或表情贴纸类必须引用玩家消息作为证据")
     return {
         "decision": decision,
         "handoff_occurred": occurred,
-        "reason_type": handoff["reason_type"],
+        "reason_type": reason_type,
         "confidence": _require_confidence(handoff.get("confidence"), "human_handoff.confidence"),
-        "evidence_message_ids": _require_message_ids(
-            handoff.get("evidence_message_ids", []), "human_handoff.evidence_message_ids", message_roles,
-        ),
+        "evidence_message_ids": evidence_ids,
         "reason": handoff.get("reason") if isinstance(handoff.get("reason"), str) else "",
         "needs_manual_review": needs_review,
         "manual_review_reason": review_reason,
@@ -379,7 +456,7 @@ def validate_slice_result(result: object, payload: dict) -> dict:
     normalized_issues.sort(key=lambda x: x["confidence"], reverse=True)
     quality["issues"] = normalized_issues
 
-    result["human_handoff"] = _validate_human_handoff(result.get("human_handoff"), message_roles)
+    result["human_handoff"] = _validate_human_handoff(result.get("human_handoff"), message_roles, payload.get("messages"))
     knowledge = _validate_knowledge_suggestion(result.get("knowledge_suggestion"), message_roles)
     result["knowledge_suggestion"] = knowledge
     result["term_suggestions"] = _validate_term_suggestions(
