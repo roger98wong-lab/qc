@@ -261,6 +261,55 @@ class ValidateSliceResultTest(unittest.TestCase):
         self.assertEqual(result["knowledge_suggestion"]["validation_status"], "unvalidated")
         self.assertFalse(result["term_suggestions"]["has_terms"])
 
+    def test_legacy_handoff_without_detail_remains_valid(self):
+        result = validate_slice_result(analyzed_result(handoff()), payload())
+        self.assertIsNone(result["human_handoff"]["detail_type"])
+
+    def test_all_business_details_survive_validation(self):
+        for detail in analyzer_mod.HANDOFF_DETAIL_TYPES:
+            with self.subTest(detail=detail):
+                review = detail == "信息不足无法判断"
+                result = validate_slice_result(analyzed_result(handoff(
+                    detail_type=detail, needs_manual_review=review,
+                    manual_review_reason="附件缺失，无法确定主问题" if review else None,
+                )), payload())
+                self.assertEqual(result["human_handoff"]["detail_type"], detail)
+                self.assertEqual(result["human_handoff"]["decision"], "handoff_reasonable")
+                self.assertTrue(result["human_handoff"]["handoff_occurred"])
+
+    def test_invalid_detail_and_wrong_parent_rejected(self):
+        for detail in ("后台代操作", "核实日志或账号数据", "未细分", "", [], {}, True, 42):
+            with self.subTest(detail=detail), self.assertRaises(AnalysisProtocolError):
+                validate_slice_result(analyzed_result(handoff(detail_type=detail)), payload())
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(analyzed_result(handoff(
+                reason_type="玩家明确要求人工", detail_type="充值金额查询",
+            )), payload())
+        result = validate_slice_result(analyzed_result(handoff(
+            reason_type="玩家明确要求人工", detail_type=None,
+        )), payload())
+        self.assertIsNone(result["human_handoff"]["detail_type"])
+
+    def test_insufficient_detail_requires_review_without_changing_decision(self):
+        for kwargs in ({}, {"needs_manual_review": True, "manual_review_reason": ""}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(AnalysisProtocolError):
+                validate_slice_result(analyzed_result(handoff(
+                    detail_type="信息不足无法判断", **kwargs,
+                )), payload())
+        with self.assertRaises(AnalysisProtocolError):
+            validate_slice_result(analyzed_result(handoff(
+                detail_type="充值金额查询", needs_manual_review=True, manual_review_reason="分类待定",
+            )), payload())
+
+    def test_code_request_details_require_occurred(self):
+        source = payload_without_human()
+        for detail in ("兑换社区互动码", "VIP专属福利码"):
+            with self.subTest(detail=detail), self.assertRaises(AnalysisProtocolError):
+                validate_slice_result(analyzed_result(handoff(
+                    detail_type=detail, decision="handoff_required", handoff_occurred=False,
+                    evidence_message_ids=["m001"],
+                ), source), source)
+
     def test_missing_handoff_is_rejected(self):
         with self.assertRaises(AnalysisProtocolError):
             validate_slice_result({
@@ -508,6 +557,98 @@ class ValidateSliceResultTest(unittest.TestCase):
             "errors": [],
         }
         validated = validate_slice_result(result, line_payload)
+        self.assertTrue(validated["human_handoff"]["handoff_occurred"])
+
+    def test_vietnamese_offline_registration_queue_allows_occurred_without_ai(self):
+        payload_data = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "DC",
+            "game": "冒险大作战",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "[file]", "sequence": 1},
+                {
+                    "message_id": "m002",
+                    "speaker": "system",
+                    "text": "Nhân viên chăm sóc khách hàng hiện tạm thời không trực tuyến. "
+                    "Tôi đã ghi nhận vấn đề của bạn, và khi họ trực tuyến sẽ ưu tiên xử lý.",
+                    "sequence": 2,
+                },
+                {"message_id": "m003", "speaker": "human_agent", "text": "Chào bạn.", "sequence": 3},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m002"), translation("m003")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(
+                evidence_message_ids=["m001", "m002"],
+                reason="系统已登记并排队等待人工上线。",
+            ),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        validated = validate_slice_result(result, payload_data)
+        self.assertTrue(validated["human_handoff"]["handoff_occurred"])
+
+    def test_translated_transfer_evidence_handles_unlisted_source_language(self):
+        payload_data = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "DC",
+            "game": "冒险大作战",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "[file]", "sequence": 1},
+                {"message_id": "m002", "speaker": "system", "text": "Agente indisponível.", "sequence": 2},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m002", "客服当前不在线，已为您登记问题，上线后会优先处理。")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m001", "m002"]),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        validated = validate_slice_result(result, payload_data)
+        self.assertTrue(validated["human_handoff"]["handoff_occurred"])
+
+    def test_agent_labeled_offline_message_allows_occurred(self):
+        payload_data = {
+            "schema_version": "1.0.0",
+            "slice_id": "slice-001",
+            "channel": "VK",
+            "game": "热血神剑",
+            "region": "欧美",
+            "messages": [
+                {"message_id": "m001", "speaker": "player", "text": "help", "sequence": 1},
+                {"message_id": "m002", "speaker": "human_agent", "text": "Currently offline; I recorded your request.", "sequence": 2},
+                {"message_id": "m003", "speaker": "human_agent", "text": "We will review it.", "sequence": 3},
+            ],
+        }
+        result = {
+            "schema_version": "2.0.0",
+            "slice_id": "slice-001",
+            "analysis_status": "completed",
+            "messages": [translation("m001"), translation("m002"), translation("m003")],
+            "quality_check": {"has_issue": False, "issues": []},
+            "human_handoff": handoff(evidence_message_ids=["m002", "m003"]),
+            "knowledge_suggestion": knowledge_skip(),
+            "term_suggestions": {"has_terms": False, "terms": []},
+            "warnings": [],
+            "errors": [],
+        }
+        validated = validate_slice_result(result, payload_data)
         self.assertTrue(validated["human_handoff"]["handoff_occurred"])
 
     def test_transfer_form_submitted_allows_occurred_without_ai(self):

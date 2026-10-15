@@ -4,6 +4,7 @@ AI 质检分析引擎
 import json
 from services.maas_client import MaaSClientError, chat_completion
 import config
+from handoff_taxonomy import BACKEND_HANDOFF_REASON, HANDOFF_DETAIL_TYPES, INSUFFICIENT_DETAIL
 
 ISSUE_CATEGORIES = (
     "答非所问", "意图识别错误", "无效回复", "严重语法/乱码",
@@ -172,10 +173,19 @@ def _slice_has_transfer_form_event(messages) -> bool:
 _TRANSFER_PROCESS_MARKERS = (
     "转接", "已转", "登记", "记录了您的问题", "记录了你的问题", "已记录您的问题", "已记录你的问题",
     "上线后", "优先处理", "已受理", "排队",
-    "おつなぎ", "つなぎしました",
+    "おつなぎ", "つなぎしました", "担当者はオフライン", "担当者がオンラインになり次第",
     "transferred you", "registered your", "when an agent is online", "when the operator",
-    "handled with priority",
-    "зарегистрировал",
+    "handled with priority", "currently offline", "recorded your request", "contact you as soon",
+    "зарегистрировал", "перевел вас к оператору", "оператор сейчас не в сети",
+    "客服不在线", "人工客服暂时不在线", "已为您登记", "已登记问题", "已记录问题",
+    "上线后会优先", "优先处理您的问题", "转人工", "转接人工", "接通专属客服", "接通客服代表", "已为你接通", "请稍等片刻",
+    "çevrimdışı", "sorununuzu kaydettim", "no está disponible", "he registrado su solicitud",
+    "ยังไม่ออนไลน์", "ลงทะเบียนปัญหา",
+    # Vietnamese offline-queue templates used by the overseas support channel.
+    "nhân viên chăm sóc khách hàng hiện tạm thời không trực tuyến",
+    "đã ghi nhận vấn đề của bạn",
+    "khi họ trực tuyến sẽ ưu tiên xử lý",
+    "khi nhân viên trực tuyến sẽ ưu tiên xử lý",
 )
 
 
@@ -183,17 +193,37 @@ def _message_body(message: dict) -> str:
     return str(message.get("text") or message.get("content") or "")
 
 
+def _message_texts(message: dict) -> list[str]:
+    """Return source and validated Chinese text for transfer evidence checks."""
+    texts = [_message_body(message)]
+    translation = message.get("translation")
+    if isinstance(translation, dict):
+        translated = translation.get("translated_text")
+        if isinstance(translated, str):
+            texts.append(translated)
+    return [text.lower() for text in texts if text]
+
+
 def _slice_has_transfer_like_system_message(messages) -> bool:
-    """True when a system/auto_reply body looks like transfer or offline queue."""
+    """True when an explicit system/agent transfer or offline-queue message exists.
+
+    Some channels label the offline registration message as ``human_agent``
+    before the actual agent reply.  We inspect that role only for explicit
+    transfer markers; an arbitrary human reply is still insufficient evidence.
+    """
     for message in messages or []:
         if not isinstance(message, dict):
             continue
         speaker = str(message.get("speaker") or "")
         is_system = speaker == "system" or message.get("is_auto")
-        if not is_system:
+        is_agent_transfer = speaker == "human_agent"
+        if not (is_system or is_agent_transfer):
             continue
-        blob = _message_body(message).lower()
-        if any(marker.lower() in blob for marker in _TRANSFER_PROCESS_MARKERS):
+        if any(
+            marker.lower() in text
+            for text in _message_texts(message)
+            for marker in _TRANSFER_PROCESS_MARKERS
+        ):
             return True
     return False
 
@@ -221,6 +251,15 @@ def _validate_human_handoff(handoff, message_roles: dict[str, str], payload_mess
     reason_type = handoff.get("reason_type")
     if reason_type not in HANDOFF_REASON_TYPES:
         raise AnalysisProtocolError("human_handoff.reason_type 非法或缺失")
+    # Missing/null detail remains compatible with the deployed legacy MaaS prompt.
+    detail_type = handoff.get("detail_type")
+    if detail_type is not None:
+        if not isinstance(detail_type, str) or detail_type not in HANDOFF_DETAIL_TYPES:
+            raise AnalysisProtocolError("human_handoff.detail_type 非法")
+        if reason_type != BACKEND_HANDOFF_REASON:
+            raise AnalysisProtocolError("human_handoff.detail_type 仅适用于需要人工权限或后台处理")
+    if detail_type in ("兑换社区互动码", "VIP专属福利码") and not occurred:
+        raise AnalysisProtocolError("社区码或VIP福利码细分仅适用于索取后已转人工")
     has_human = any(role == "human_agent" for role in message_roles.values())
     if decision == "handoff_required" and has_human:
         raise AnalysisProtocolError("已有人工客服消息时不得判定应转未转")
@@ -236,7 +275,7 @@ def _validate_human_handoff(handoff, message_roles: dict[str, str], payload_mess
         raise AnalysisProtocolError("附件或表情贴纸类只能判定为应转或合理转")
     needs_review = _require_bool(handoff.get("needs_manual_review"), "human_handoff.needs_manual_review")
     review_reason = _optional_text(handoff.get("manual_review_reason"))
-    if decision == "manual_review":
+    if decision == "manual_review" or detail_type == INSUFFICIENT_DETAIL:
         if not needs_review or not review_reason:
             raise AnalysisProtocolError("human_handoff 需人工复核时必须填写原因")
     elif needs_review or review_reason:
@@ -250,6 +289,7 @@ def _validate_human_handoff(handoff, message_roles: dict[str, str], payload_mess
         "decision": decision,
         "handoff_occurred": occurred,
         "reason_type": reason_type,
+        "detail_type": detail_type,
         "confidence": _require_confidence(handoff.get("confidence"), "human_handoff.confidence"),
         "evidence_message_ids": evidence_ids,
         "reason": handoff.get("reason") if isinstance(handoff.get("reason"), str) else "",
@@ -456,7 +496,10 @@ def validate_slice_result(result: object, payload: dict) -> dict:
     normalized_issues.sort(key=lambda x: x["confidence"], reverse=True)
     quality["issues"] = normalized_issues
 
-    result["human_handoff"] = _validate_human_handoff(result.get("human_handoff"), message_roles, payload.get("messages"))
+    # Use the immutable messages enriched with MaaS translations.  This lets
+    # transfer evidence be checked in Chinese even when the source text is a
+    # language not covered by the fallback marker catalog.
+    result["human_handoff"] = _validate_human_handoff(result.get("human_handoff"), message_roles, result.get("messages"))
     knowledge = _validate_knowledge_suggestion(result.get("knowledge_suggestion"), message_roles)
     result["knowledge_suggestion"] = knowledge
     result["term_suggestions"] = _validate_term_suggestions(

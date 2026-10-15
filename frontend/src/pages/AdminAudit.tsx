@@ -1,3 +1,4 @@
+import { BACKEND_HANDOFF_REASON, handoffDetailLabel, handoffReviewLabel } from '../handoffDetail'
 import { useEffect, useState } from 'react'
 import { Alert, Card, Descriptions, Drawer, Select, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd'
 import { adminApi } from '../api'
@@ -50,6 +51,7 @@ export default function AdminAudit() {
     { title: '操作', render: (_: any, row: any) => <a onClick={() => adminApi.getAuditSlice(row.id).then(r => setDetail(r.data))}>详情</a> },
   ]
   const detailRow = detail || {}
+  const handoffReview = handoffReviewLabel(detailRow.human_handoff)
   const transcript = conversationFromIssue(detailRow)
   const sliceTable = <Card extra={<Select allowClear placeholder="选择分析状态" style={{ width: 140 }} value={status} onChange={setStatus} options={['pending', 'processing', 'completed', 'partial', 'failed'].map(v => ({ value: v, label: ANALYSIS_STATUS_LABELS[v] }))} />}>
       <Table rowKey="id" loading={loading} dataSource={rows} columns={columns} scroll={{ x: 1000 }} size="small" locale={{ emptyText: '暂无分析记录' }} />
@@ -74,7 +76,10 @@ export default function AdminAudit() {
           <Descriptions.Item label="分析状态"><StatusTag value={detailRow.analysis_status} labels={ANALYSIS_STATUS_LABELS} /></Descriptions.Item>
           <Descriptions.Item label="知识建议"><StatusTag value={detailRow.knowledge_decision} labels={KNOWLEDGE_DECISION_LABELS} /></Descriptions.Item>
           <Descriptions.Item label="分析时间"><Tooltip title={displayValue(detailRow.completed_at || detailRow.started_at || detailRow.created_at)}>{formatDateTime(detailRow.completed_at || detailRow.started_at || detailRow.created_at)}</Tooltip></Descriptions.Item>
+          {detailRow.human_handoff?.reason_type === BACKEND_HANDOFF_REASON ? <Descriptions.Item label="主问题标签">{handoffDetailLabel(detailRow.human_handoff)}</Descriptions.Item> : null}
           {detailRow.human_handoff ? <Descriptions.Item label="转人工">{displayValue(detailRow.human_handoff.reason_type)} · {detailRow.human_handoff.handoff_occurred ? '已转人工' : '未转人工'}</Descriptions.Item> : null}
+          {handoffReview ? <Descriptions.Item label="复核状态"><Tag color="warning">{handoffReview}</Tag></Descriptions.Item> : null}
+          {handoffReview ? <Descriptions.Item label="复核原因">{displayValue(detailRow.human_handoff.manual_review_reason, '未提供复核原因')}</Descriptions.Item> : null}
         </Descriptions>
         <ConversationMessageList conversation={transcript} emptyText="暂无切片消息" />
         {detailRow.error_message && <Text type="danger">错误：{detailRow.error_message}</Text>}

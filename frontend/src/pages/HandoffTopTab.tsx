@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Card, DatePicker, Empty, Select, Spin, Table, Tag, Typography } from 'antd'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Alert, Button, Card, DatePicker, Empty, Select, Spin, Table, Tag, Tooltip, Typography } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import dayjs, { type Dayjs } from 'dayjs'
 import { adminApi } from '../api'
 import MultiFilterSelect from '../components/MultiFilterSelect'
+
+import { BACKEND_HANDOFF_REASON, handoffDetailLabel, handoffReviewLabel } from '../handoffDetail'
 
 const { Text } = Typography
 const { RangePicker } = DatePicker
@@ -44,13 +46,19 @@ type SliceRow = {
     decision?: string
     handoff_occurred?: boolean
     reason_type?: string
+    detail_type?: string | null
     reason?: string
+    needs_manual_review?: boolean
+    manual_review_reason?: string | null
   }
 }
 
 type Payload = {
   scope: string
   selected_reason_type: string | null
+  selected_detail_type?: string | null
+  detail_parent_count?: number
+  details?: { detail_type: string; count: number; share: number }[]
   summary: {
     analyzed: number
     occurred: number
@@ -84,6 +92,8 @@ export default function HandoffTopTab({ onOpenDetail }: { onOpenDetail: (id: num
   const [regions, setRegions] = useState<string[]>([])
   const [batchIds, setBatchIds] = useState<number[]>([])
   const [reasonType, setReasonType] = useState<string>()
+  const [detailType, setDetailType] = useState<string>()
+  const requestId = useRef(0)
   const [page, setPage] = useState(1)
   const [data, setData] = useState<Payload>()
   const [loading, setLoading] = useState(false)
@@ -102,25 +112,30 @@ export default function HandoffTopTab({ onOpenDetail }: { onOpenDetail: (id: num
     if (regions.length) params.region = regions.join(',')
     if (batchIds.length) params.batch_ids = batchIds.join(',')
     if (reasonType) params.reason_type = reasonType
+    if (reasonType === BACKEND_HANDOFF_REASON && detailType) params.detail_type = detailType
     return params
-  }, [batchIds, channels, games, page, range, reasonType, regions, scope])
+  }, [batchIds, channels, games, page, range, reasonType, detailType, regions, scope])
 
   const load = useCallback(async () => {
+    const currentRequest = ++requestId.current
     setLoading(true)
     setError('')
     try {
       const result = await adminApi.getHandoffTop(query)
-      setData(result.data)
+      if (currentRequest === requestId.current) setData(result.data)
     } catch (err: any) {
+      if (currentRequest !== requestId.current) return
       setData(undefined)
       setError(err?.response?.data?.detail || '转人工类型统计加载失败，请稍后重试。')
     } finally {
-      setLoading(false)
+      if (currentRequest === requestId.current) setLoading(false)
     }
   }, [query])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load(); return () => { requestId.current += 1 } }, [load])
 
+  const isDrilledDown = reasonType === BACKEND_HANDOFF_REASON
+  const maxDetailCount = Math.max(1, ...(data?.details || []).map(item => item.count))
   const maxCount = Math.max(1, ...(data?.reasons || []).map(item => item.count))
   const cards: [string, number][] = [
     ['已转人工', data?.summary.occurred || 0],
@@ -140,7 +155,7 @@ export default function HandoffTopTab({ onOpenDetail }: { onOpenDetail: (id: num
           </label>
           <label>
             <span>统计口径</span>
-            <Select value={scope} options={SCOPE_OPTIONS} onChange={value => { setScope(value); setPage(1); setReasonType(undefined) }} />
+            <Select value={scope} options={SCOPE_OPTIONS} onChange={value => { setScope(value); setPage(1); setReasonType(undefined); setDetailType(undefined) }} />
           </label>
           <label>
             <span>游戏</span>
@@ -178,11 +193,13 @@ export default function HandoffTopTab({ onOpenDetail }: { onOpenDetail: (id: num
                 <button
                   key={item.reason_type}
                   type="button"
+                  disabled={loading}
+                  aria-pressed={reasonType === item.reason_type}
                   className={`qc-handoff-rank-row${reasonType === item.reason_type ? ' is-active' : ''}`}
-                  onClick={() => { setReasonType(current => current === item.reason_type ? undefined : item.reason_type); setPage(1) }}
+                  onClick={() => { setReasonType(current => current === item.reason_type ? undefined : item.reason_type); setDetailType(undefined); setPage(1) }}
                 >
                   <span className="qc-handoff-rank-name">
-                    {item.reason_type}
+                    {item.reason_type}{item.reason_type === BACKEND_HANDOFF_REASON ? ' ›' : ''}
                     {item.is_positive ? null : <Tag>非正向原因</Tag>}
                   </span>
                   <span className="qc-handoff-rank-bar" aria-hidden="true"><i style={{ width: `${Math.max(6, (item.count / maxCount) * 100)}%` }} /></span>
@@ -193,10 +210,41 @@ export default function HandoffTopTab({ onOpenDetail }: { onOpenDetail: (id: num
           ) : <Empty className="qc-workload-empty" description="当前筛选范围内没有转人工数据" />}
         </Spin>
       </Card>
-      <Card className="qc-workload-trend-card" title={reasonType ? `切片明细 · ${reasonType}` : '切片明细'} extra={<Text type="secondary">点击类型可筛选</Text>}>
+      {isDrilledDown ? (
+        <Card
+          className="qc-workload-trend-card"
+          title="需要人工权限或后台处理 · 主问题 TOP"
+          extra={<Button onClick={() => { setReasonType(undefined); setDetailType(undefined); setPage(1) }}>返回一级</Button>}
+        >
+          <Text type="secondary">占比 = 该主问题条数 ÷ 当前筛选及统计口径下“需要人工权限或后台处理”总数（{data?.detail_parent_count || 0} 条，含未细分）。</Text>
+          {detailType ? <Button type="link" onClick={() => { setDetailType(undefined); setPage(1) }}>查看该一级全部明细</Button> : null}
+          <Spin spinning={loading}>
+            {data?.details?.length ? (
+              <div className="qc-handoff-rank" role="list">
+                {data.details.map(item => (
+                  <button
+                    key={item.detail_type}
+                    type="button"
+                    disabled={loading}
+                    aria-pressed={detailType === item.detail_type}
+                    className={`qc-handoff-rank-row${detailType === item.detail_type ? ' is-active' : ''}`}
+                    onClick={() => { setDetailType(current => current === item.detail_type ? undefined : item.detail_type); setPage(1) }}
+                  >
+                    <span className="qc-handoff-rank-name">{item.detail_type}</span>
+                    <span className="qc-handoff-rank-bar" aria-hidden="true"><i style={{ width: `${Math.max(6, (item.count / maxDetailCount) * 100)}%` }} /></span>
+                    <span className="qc-handoff-rank-count">{item.count} · {percent(item.share)}</span>
+                  </button>
+                ))}
+              </div>
+            ) : <Empty description="当前筛选范围内没有该一级类别的数据" />}
+          </Spin>
+        </Card>
+      ) : null}
+      <Card className="qc-workload-trend-card" title={reasonType ? `切片明细 · ${reasonType}${detailType ? ` / ${detailType}` : ''}` : '切片明细'} extra={<Text type="secondary">点击类型可筛选</Text>}>
         <Table
           rowKey="id"
           size="small"
+          scroll={{ x: 1300 }}
           loading={loading}
           dataSource={data?.slices || []}
           pagination={{ current: data?.page || page, pageSize: data?.page_size || 20, total: data?.total || 0, showSizeChanger: false, onChange: setPage }}
@@ -209,11 +257,16 @@ export default function HandoffTopTab({ onOpenDetail }: { onOpenDetail: (id: num
             { title: '地区', dataIndex: 'region', width: 90, render: (value: string) => value || '—' },
             { title: '结论', dataIndex: ['human_handoff', 'decision'], width: 120, render: (value: string) => HANDOFF_DECISION_LABELS[value] || value || '—' },
             { title: '原因类型', dataIndex: ['human_handoff', 'reason_type'], ellipsis: true },
+            { title: '主问题标签', render: (_: unknown, row: SliceRow) => handoffDetailLabel(row.human_handoff) },
+            { title: '复核状态', width: 165, render: (_: unknown, row: SliceRow) => {
+              const label = handoffReviewLabel(row.human_handoff)
+              return label ? <Tooltip title={row.human_handoff?.manual_review_reason || '未提供复核原因'}><Tag color="warning">{label}</Tag></Tooltip> : '—'
+            } },
             { title: '操作', width: 70, render: (_: unknown, row: SliceRow) => <a onClick={() => onOpenDetail(row.id)}>详情</a> },
           ]}
         />
       </Card>
-      <Text className="qc-workload-note" type="secondary">默认统计已转人工切片。附件和表情贴纸按协议视为必须转人工；历史切片在重跑分析前不会出现这两类。</Text>
+      <Text className="qc-workload-note" type="secondary">默认统计已转人工切片。点击“需要人工权限或后台处理”查看二级分类；历史数据不重跑，缺少二级分类时显示“未细分”。</Text>
     </div>
   )
 }

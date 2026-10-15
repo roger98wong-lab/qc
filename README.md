@@ -55,6 +55,16 @@ MaaS 工作流内分为两个职责节点：
 
 管理页的“转人工类型 TOP”直接基于 `human_handoff` 聚合：已发生转人工只统计 `handoff_occurred=true`，应转未转只统计 `decision=handoff_required`。聚合不根据人工消息数量推断转人工，原因类型的桶、决策枚举和附件/贴纸绑定保持与 MaaS 协议一致。
 
+### 转人工二级分类
+
+仅一级原因“需要人工权限或后台处理”使用 `human_handoff.detail_type`，新模型输出须从 20 个封闭标签中单选，其余一级原因填 null。完整定义见 `docs/maas-qc-system-prompt.md` 的 HandoffDetailRules。
+
+TOP 保留一级原因排行，点击该一级原因展开主问题排行，再点击二级标签筛选明细。二级占比的分母始终是当前时间、游戏、渠道、地区、批次和统计口径下该一级原因的总数（含“未细分”），不随二级筛选或分页变化。API 新增可选 `detail_type` 查询参数和 `details`、`detail_parent_count`、`selected_detail_type` 返回字段；原接口字段及统计口径保留。
+
+历史数据不重跑、不回填；二级字段缺失/null 的旧结果继续兼容并显示“未细分”，不会虚构分类。读取时异常的旧字段也归入“未细分”；新输出中非空非法枚举或跨一级绑定会被拒绝。“信息不足无法判断”必须要求人工复核及填写原因，但不凭分类不确定改变转接事实/合理性判断。TOP 明细显示分类待复核标记，悬停可查看原因，详情抽屉完整展示复核状态及原因；分类待复核不改变既有 decision 统计口径。
+
+上线顺序：先部署兼容代码并重启后端，再将 `docs/maas-qc-system-prompt.md` 从 Role 起同步到 MaaS「AI对话质检」节点。`docs/maas-system-prompt.md` 是历史存档，不用于发布当前工作流。若工作流另设输出 Schema，需同时允许可空字符串 `human_handoff.detail_type`。仓库不会自动发布 MaaS 配置，旧提示词未同步前的新结果仍显示“未细分”。本改动不迁移数据库表，不运行历史批次。
+
 ## 知识候选和术语沉淀
 
 知识库节点只评估人工客服回答。`answer_message_ids` 必须指向 `human_agent`；AI、玩家、系统、系统推送和广播都不能作为答案来源。没有人工客服消息时，结论只能是 `no_human_answer`。

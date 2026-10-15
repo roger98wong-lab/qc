@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from handoff_taxonomy import BACKEND_HANDOFF_REASON, display_detail_type
 
 HANDOFF_TOP_SCOPES = ("occurred", "required", "unreasonable")
 NON_POSITIVE_REASON_TYPES = frozenset({"可由AI继续处理", "证据不足"})
@@ -42,7 +43,8 @@ def _empty_bucket(reason_type: str) -> dict:
 
 
 def aggregate_handoff_top(records: list[dict], *, scope: str = "occurred",
-                          reason_type: str | None = None, page: int = 1, page_size: int = 20) -> dict:
+                          reason_type: str | None = None, detail_type: str | None = None,
+                          page: int = 1, page_size: int = 20) -> dict:
     if scope not in HANDOFF_TOP_SCOPES:
         scope = "occurred"
     page = max(int(page or 1), 1)
@@ -103,12 +105,33 @@ def aggregate_handoff_top(records: list[dict], *, scope: str = "occurred",
     filtered = scoped
     if selected:
         filtered = [row for row in scoped if str(row["human_handoff"].get("reason_type") or "") == selected]
+    # Calculate the denominator before filtering a detail or paginating.
+    detail_parent_count = 0
+    details = []
+    selected_detail = None
+    if selected == BACKEND_HANDOFF_REASON:
+        detail_parent_count = len(filtered)
+        detail_counts: dict[str, int] = {}
+        for row in filtered:
+            key = display_detail_type(row["human_handoff"])
+            detail_counts[key] = detail_counts.get(key, 0) + 1
+        details = sorted(
+            ({"detail_type": key, "count": count,
+              "share": round(count / detail_parent_count, 4)} for key, count in detail_counts.items()),
+            key=lambda item: (-item["count"], item["detail_type"]),
+        )
+        selected_detail = (detail_type or "").strip() or None
+        if selected_detail:
+            filtered = [row for row in filtered if display_detail_type(row["human_handoff"]) == selected_detail]
     total = len(filtered)
     start = (page - 1) * page_size
     slices = filtered[start:start + page_size]
     return {
         "scope": scope,
         "selected_reason_type": selected,
+        "selected_detail_type": selected_detail,
+        "detail_parent_count": detail_parent_count,
+        "details": details,
         "summary": summary,
         "scoped_count": total_scoped,
         "reasons": reasons,

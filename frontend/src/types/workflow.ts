@@ -64,6 +64,7 @@ export interface HumanHandoff {
   decision: SliceHandoffDecision
   handoff_occurred: boolean
   reason_type: string
+  detail_type?: string | null
   confidence: number
   evidence_message_ids: string[]
   reason: string

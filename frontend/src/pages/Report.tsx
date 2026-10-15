@@ -1,3 +1,4 @@
+import { BACKEND_HANDOFF_REASON, handoffDetailLabel } from '../handoffDetail'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
@@ -154,6 +155,7 @@ function HumanHandoffCard({ handoff, onFocusMessage }: { handoff: any; onFocusMe
       <Descriptions.Item label="转人工结论">{HANDOFF_DECISION_LABELS[handoff.decision] || displayValue(handoff.decision)}</Descriptions.Item>
       <Descriptions.Item label="是否已转人工">{handoff.handoff_occurred ? '已转人工' : '未转人工'}</Descriptions.Item>
       <Descriptions.Item label="原因类型">{displayValue(handoff.reason_type)}</Descriptions.Item>
+      {handoff.reason_type === BACKEND_HANDOFF_REASON ? <Descriptions.Item label="主问题标签">{handoffDetailLabel(handoff)}</Descriptions.Item> : null}
       <Descriptions.Item label="原因">{displayValue(handoff.reason)}</Descriptions.Item>
       {handoff.needs_manual_review ? <Descriptions.Item label="人工复核原因">{displayValue(handoff.manual_review_reason)}</Descriptions.Item> : null}
       <Descriptions.Item label="证据消息">

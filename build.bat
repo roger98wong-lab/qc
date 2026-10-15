@@ -1,19 +1,31 @@
 @echo off
+setlocal EnableExtensions
 chcp 65001 > nul
-title 构建前端
+title Build Frontend
 
-echo 正在构建前端界面...
-cd /d "%~dp0frontend"
-if exist "C:\Program Files\nodejs\npm.cmd" (
-    call "C:\Program Files\nodejs\npm.cmd" run build
-) else (
-    call npm.cmd run build
+cd /d "%~dp0"
+set "PROJECT_ROOT=%CD%"
+set "ENSURE_ENV=%PROJECT_ROOT%\scripts\ensure-env.ps1"
+if not exist "%ENSURE_ENV%" (
+    echo ERROR: environment check script not found: %ENSURE_ENV%
+    pause
+    exit /b 1
 )
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ENSURE_ENV%"
+if errorlevel 1 (
+    echo ERROR: environment check failed. Build was not started.
+    pause
+    exit /b 1
+)
+echo Building frontend...
+cd /d "%PROJECT_ROOT%\frontend"
+call npm.cmd run build
 
-echo.
-if %ERRORLEVEL% == 0 (
-    echo 构建完成！前端已更新到 backend\static 目录。
-) else (
-    echo 构建失败，请查看错误信息。
+if not "%ERRORLEVEL%"=="0" (
+    echo ERROR: frontend build failed.
+    pause
+    exit /b 1
 )
+echo Frontend build completed: backend\static
 pause
+endlocal

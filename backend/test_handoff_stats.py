@@ -76,5 +76,60 @@ class HandoffStatsTest(unittest.TestCase):
         self.assertEqual(result["selected_reason_type"], "玩家消息包含附件")
 
 
+
+class DetailStatsTest(unittest.TestCase):
+    parent = "需要人工权限或后台处理"
+
+    def records(self):
+        records = [row(self.parent, "handoff_reasonable", True, str(i)) for i in range(5)]
+        records[0]["human_handoff"]["detail_type"] = "充值金额查询"
+        records[1]["human_handoff"]["detail_type"] = "充值金额查询"
+        records[2]["human_handoff"]["detail_type"] = "VIP认证"
+        records[4]["human_handoff"]["detail_type"] = None
+        records += [row("玩家明确要求人工", "handoff_reasonable", True, "other")]
+        return records
+
+    def test_parent_denominator_includes_legacy_and_ignores_pagination(self):
+        records = self.records()
+        result = aggregate_handoff_top(records, reason_type=self.parent,
+                                       detail_type="充值金额查询", page=2, page_size=1)
+        self.assertEqual(result["scoped_count"], 6)
+        self.assertEqual(result["detail_parent_count"], 5)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(len(result["slices"]), 1)
+        details = {item["detail_type"]: item for item in result["details"]}
+        self.assertEqual(details["充值金额查询"]["share"], .4)
+        self.assertEqual(details["未细分"]["count"], 2)
+        self.assertEqual(sum(item["count"] for item in result["details"]), 5)
+        self.assertNotIn("detail_type", records[3]["human_handoff"])
+
+    def test_unclassified_can_be_filtered_and_malformed_legacy_is_safe(self):
+        records = self.records()
+        for bad in ("", "旧的未知标签", [], {"value": "充值金额查询"}):
+            records[4]["human_handoff"]["detail_type"] = bad
+            result = aggregate_handoff_top(records, reason_type=self.parent, detail_type="未细分")
+            self.assertEqual(result["total"], 2)
+            self.assertEqual(result["detail_parent_count"], 5)
+
+    def test_other_parent_never_uses_detail_filter(self):
+        result = aggregate_handoff_top(self.records(), reason_type="玩家明确要求人工",
+                                       detail_type="充值金额查询")
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["details"], [])
+        self.assertIsNone(result["selected_detail_type"])
+
+    def test_scopes_and_empty_parent(self):
+        records = self.records()
+        records[0]["human_handoff"].update(decision="handoff_required", handoff_occurred=False)
+        records[1]["human_handoff"].update(decision="handoff_unreasonable")
+        for scope in ("required", "unreasonable"):
+            result = aggregate_handoff_top(records, scope=scope, reason_type=self.parent)
+            self.assertEqual(result["detail_parent_count"], 1)
+            self.assertEqual(result["details"][0]["share"], 1)
+        empty = aggregate_handoff_top([], reason_type=self.parent)
+        self.assertEqual(empty["details"], [])
+        self.assertEqual(empty["detail_parent_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

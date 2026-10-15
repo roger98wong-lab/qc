@@ -331,6 +331,9 @@ def _handoff_slice_record(row):
             "decision": handoff.get("decision"),
             "handoff_occurred": handoff.get("handoff_occurred"),
             "reason_type": handoff.get("reason_type"),
+            "detail_type": handoff.get("detail_type"),
+            "needs_manual_review": handoff.get("needs_manual_review") is True,
+            "manual_review_reason": handoff.get("manual_review_reason"),
             "reason": handoff.get("reason") or "",
             "confidence": handoff.get("confidence"),
         } if isinstance(handoff, dict) else None,
@@ -343,6 +346,7 @@ def audit_handoff_top(
     batch_id: int | None = None, batch_ids: str | None = None, analysis_status: str | None = None,
     channel: str | None = None, game: str | None = None, region: str | None = None,
     scope: str = Query("occurred"), reason_type: str | None = None,
+    detail_type: str | None = None,
     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
     admin: User = Depends(require_admin), db=Depends(get_db),
 ):
@@ -392,7 +396,7 @@ def audit_handoff_top(
         and (not analysis_status or row.get("analysis_status") == analysis_status)
     ]
     result = aggregate_handoff_top(
-        filtered, scope=scope, reason_type=reason_type, page=page, page_size=page_size,
+        filtered, scope=scope, reason_type=reason_type, detail_type=detail_type, page=page, page_size=page_size,
     )
     result["filters"] = {
         "games": sorted(games),
